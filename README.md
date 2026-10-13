@@ -5,6 +5,12 @@
   </picture>
 </p>
 
+> **Basalt-Windows** — private fork of [jesdga95/basalt](https://github.com/jesdga95/basalt) carrying a native
+> Windows port. Before working here, read **[WINDOWS-PORT-AUDIT.md](WINDOWS-PORT-AUDIT.md)**: it maps every
+> Linux-only call site in this tree and which file of the parent project Strata already ships a Windows
+> implementation of. The port plan is 15 files; engine semantics (kernels, formats, precision rules) are
+> unchanged from upstream, so upstream's `AGENTS.md` and `CONTRIBUTING.md` still apply.
+
 Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model. It targets one thing:
 Linux with an NVIDIA Blackwell GPU (sm_120). The experts that do not fit in VRAM live in system RAM (and optionally on
 a second GPU used as a peer expert tier), so a large MoE model runs on a single workstation.
