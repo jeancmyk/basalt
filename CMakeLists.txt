@@ -39,13 +39,33 @@ set(_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
 # Warnings live on an INTERFACE target the project's own C++ code links, NOT in add_compile_options: applied
 # globally they would also hit the extracted ggml C and CUDA sources, whose warnings are not this project's to fix.
-# The flags are guarded by COMPILE_LANGUAGE:CXX so nvcc never receives them as inputs.
+# The flags are guarded by COMPILE_LANGUAGE:CXX so nvcc never receives them as inputs, and by the compiler id:
+# MSVC reads -Wall/-Wextra as /Wall and the invalid /Wextra, so it takes its own spellings. The sources are UTF-8,
+# which MSVC only assumes when told (the Windows SDK's headers are not), hence /utf-8 for both languages.
 add_library(warnings INTERFACE)
 target_compile_options(warnings INTERFACE
-  $<$<COMPILE_LANGUAGE:CXX>:-Wall>
-  $<$<COMPILE_LANGUAGE:CXX>:-Wextra>)
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/utf-8>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wall>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wextra>
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/utf-8>)
 if(WERROR)
-  target_compile_options(warnings INTERFACE $<$<COMPILE_LANGUAGE:CXX>:-Werror>)
+  target_compile_options(warnings INTERFACE
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/WX>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Werror>)
+endif()
+
+# The vector-extension flags per file, in each compiler's spelling. MSVC has no per-feature ISA switches: /arch:
+# turns on the whole rung (and a TU built with it may use those instructions anywhere in itself, exactly as the
+# GNU flags do), so the run-time probe still decides which of these objects runs.
+if(MSVC)
+  set(_isa_avx512_flags "/arch:AVX512")
+  set(_isa_avx2_flags "/arch:AVX2")
+  set(_isa_avx1_flags "/arch:AVX")
+else()
+  set(_isa_avx512_flags "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+  set(_isa_avx2_flags "-mavx2;-mfma;-mf16c")
+  set(_isa_avx1_flags "-mavx")
 endif()
 
 # ---- artifact -------------------------------------------------------
@@ -239,13 +259,18 @@ if(BUILD_TESTING)
   target_link_libraries(conversation_validation_test PRIVATE engine)
   add_test(NAME conversation_validation_test COMMAND conversation_validation_test)
   set_tests_properties(conversation_validation_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
-  add_executable(conversation_transfer_test src/core/conversation_validation_test.cpp)
-  target_compile_definitions(conversation_transfer_test PRIVATE CONVERSATION_TEST_TRANSFERS)
-  target_link_options(conversation_transfer_test PRIVATE
-    -Wl,--wrap=cudaMemcpy -Wl,--wrap=cudaDeviceSynchronize -Wl,--wrap=cudaGetLastError)
-  target_link_libraries(conversation_transfer_test PRIVATE engine)
-  add_test(NAME conversation_transfer_test COMMAND conversation_transfer_test)
-  set_tests_properties(conversation_transfer_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+  # The transfer-failure paths are reached by GNU ld's --wrap, which symbolizes the three runtime calls. The Windows
+  # linker has no equivalent, so that one program is not built here; the same source builds the ordinary snapshot
+  # test above, which does port.
+  if(NOT WIN32)
+    add_executable(conversation_transfer_test src/core/conversation_validation_test.cpp)
+    target_compile_definitions(conversation_transfer_test PRIVATE CONVERSATION_TEST_TRANSFERS)
+    target_link_options(conversation_transfer_test PRIVATE
+      -Wl,--wrap=cudaMemcpy -Wl,--wrap=cudaDeviceSynchronize -Wl,--wrap=cudaGetLastError)
+    target_link_libraries(conversation_transfer_test PRIVATE engine)
+    add_test(NAME conversation_transfer_test COMMAND conversation_transfer_test)
+    set_tests_properties(conversation_transfer_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+  endif()
   add_executable(conversation_snapshot_test src/core/conversation_snapshot_test.cpp)
   target_link_libraries(conversation_snapshot_test PRIVATE engine)
   add_test(NAME conversation_snapshot_test COMMAND conversation_snapshot_test)
@@ -659,8 +684,8 @@ target_include_directories(kernels_cpu PUBLIC include)
 # and the engine picks the kernels at run time (cpu_avx512_ok).
 # `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
 set_source_files_properties(src/kernels/cpu/expert.cpp
-                            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
-set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+                            PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags}")
+set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 find_package(Threads REQUIRED)
 target_link_libraries(kernels_cpu PUBLIC Threads::Threads)
 
@@ -674,8 +699,8 @@ target_include_directories(ggml_quants PUBLIC include PRIVATE src/kernels/cpu/gg
 set_target_properties(ggml_quants PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
 # The CPU dot products are built for AVX2 and for AVX-512, each with its own name for the table lookup;
 # ggml_cpu_dispatch.cpp picks one at run time (cpu_avx512_ok / cpu_avx2_ok).
-set(_ggml_dots_avx2_flags -mavx2 -mfma -mf16c)
-set(_ggml_dots_avx512_flags -mavx2 -mfma -mf16c -mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512vbmi)
+set(_ggml_dots_avx2_flags ${_isa_avx2_flags})
+set(_ggml_dots_avx512_flags ${_isa_avx512_flags})
 foreach(_isa avx2 avx512)
   add_library(ggml_dots_${_isa} OBJECT src/kernels/cpu/ggml/ggml_cpu_dots.c)
   target_include_directories(ggml_dots_${_isa} PRIVATE include src/kernels/cpu/ggml)
@@ -690,11 +715,11 @@ target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels
                                          src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
                                          $<TARGET_OBJECTS:ggml_dots_avx2> $<TARGET_OBJECTS:ggml_dots_avx512>)
 set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
-                            "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
-set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+                            "${_isa_avx512_flags}")
+set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 # the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
-set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
+set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx1_flags}")
 target_link_libraries(kernels_cpu PUBLIC ggml_quants)
   # the router lookahead's dot on each rung this CPU has (AVX2, the older CPUs' AVX1) against a double reference
 add_executable(router_dot_parity src/kernels/cpu/router_dot_parity.cpp)
@@ -714,6 +739,10 @@ foreach(_t IN LISTS _mmq_types)
 endforeach()
 target_include_directories(mmq PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
+# MSVC's COFF object holds 65536 sections; the instantiated MMQ formats exceed that in one TU without /bigobj.
+if(MSVC)
+  target_compile_options(mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
+endif()
 target_link_libraries(mmq PUBLIC ggml_quants ${_gpu_runtime_target})
 target_link_libraries(prefill PUBLIC mmq)
 if(BUILD_TESTING)
