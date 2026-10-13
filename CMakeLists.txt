@@ -58,9 +58,15 @@ endif()
 # The vector-extension flags per file, in each compiler's spelling. MSVC has no per-feature ISA switches: /arch:
 # turns on the whole rung (and a TU built with it may use those instructions anywhere in itself, exactly as the
 # GNU flags do), so the run-time probe still decides which of these objects runs.
+#
+# /arch:AVX512 predefines __AVX__, __AVX2__ and __AVX512F/BW/VL/DQ__ but leaves __F16C__, __AVX512VNNI__ and
+# __AVX512VBMI__ undefined, while accepting the intrinsics of all three. The sources branch on those macros (the
+# ggml dot products pick their VNNI form by __AVX512VNNI__), so they are defined to match what the GNU flags give:
+# without it a file compiles down its no-VNNI path and runs slower than the same build on Linux. __BMI2__ is left
+# alone because -mavx2 and -mavx512* do not enable BMI2 either, so that branch is out on both platforms.
 if(MSVC)
-  set(_isa_avx512_flags "/arch:AVX512")
-  set(_isa_avx2_flags "/arch:AVX2")
+  set(_isa_avx512_flags "/arch:AVX512;-D__F16C__=1;-D__AVX512VNNI__=1;-D__AVX512VBMI__=1")
+  set(_isa_avx2_flags "/arch:AVX2;-D__F16C__=1")
   set(_isa_avx1_flags "/arch:AVX")
 else()
   set(_isa_avx512_flags "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
@@ -825,10 +831,9 @@ if(BUILD_TESTING)
   target_link_libraries(pool_stress PRIVATE kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
 
-  if(UNIX AND NOT APPLE)
-    add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)
-    target_include_directories(direct_file_async_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(direct_file_async_test PRIVATE Threads::Threads)
-    add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
-  endif()
+  add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)
+  target_include_directories(direct_file_async_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_definitions(direct_file_async_test PRIVATE BASALT_TEST_TMPDIR="${CMAKE_CURRENT_BINARY_DIR}")
+  target_link_libraries(direct_file_async_test PRIVATE Threads::Threads)
+  add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
 endif()
