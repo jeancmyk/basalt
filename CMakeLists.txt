@@ -686,10 +686,13 @@ endforeach()
 # part of kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
 # one-pass static linking has no cycle to resolve)
 target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
+                                         src/kernels/cpu/nvfp4_avx512.cpp
                                          src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
                                          src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
                                          $<TARGET_OBJECTS:ggml_dots_avx2> $<TARGET_OBJECTS:ggml_dots_avx512>)
 set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
+                            "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+set_source_files_properties(src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
                             "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
 set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
@@ -704,7 +707,7 @@ if(BUILD_TESTING)
 endif()
 # MMQ (ggml-cuda) for the prompt path's experts: the kernel, one instance per format the packs use, and the
 # activation quantizer; mmq_host.cu holds its few host symbols
-set(_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+set(_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 nvfp4)
 # the Q2_0 pack's prompt experts on the engine's own int8 kernels (moe_fused.cu)
 add_library(mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
             src/prefill/mmq/mmq_host.cu src/prefill/mmq/quantize.cu)
@@ -728,6 +731,22 @@ if(BUILD_TESTING)
   add_test(NAME prefill_fused_iq_test COMMAND prefill_fused_iq_test)
   set_tests_properties(prefill_fused_iq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()
+if(BUILD_TESTING)
+  # NVFP4 experts through MMQ (tile loader, per-16-scale dot, scale tail in SwiGLU) against CPU references, with a
+  # microbench line
+  add_executable(prefill_mmq_nvfp4_test tests/cuda/prefill_mmq_nvfp4_test.cpp)
+  target_link_libraries(prefill_mmq_nvfp4_test PRIVATE mmq ${_gpu_runtime_target})
+  add_test(NAME prefill_mmq_nvfp4_test COMMAND prefill_mmq_nvfp4_test --no-bench)
+  set_tests_properties(prefill_mmq_nvfp4_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+endif()
+if(BUILD_TESTING)
+  # NVFP4 block decode against the E2M1/UE4M3 spec (exhaustive) and ggml's row dequantizer; with an experts.bin,
+  # a real NVFP4 expert's blocks and scale tail
+  add_executable(nvfp4_format_test tests/core/nvfp4_format_test.cpp)
+  target_link_libraries(nvfp4_format_test PRIVATE artifact ggml_quants)
+  add_test(NAME nvfp4_format_test COMMAND nvfp4_format_test)
+  set_tests_properties(nvfp4_format_test PROPERTIES TIMEOUT 60)
+endif()
 add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
 target_include_directories(native_expert_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(native_expert_parity PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
@@ -738,6 +757,7 @@ target_link_libraries(native_expert_bench PRIVATE kernels kernels_cpu artifact $
 add_executable(dec_moe_parity src/kernels/dec_moe_parity.cpp)
 target_include_directories(dec_moe_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(dec_moe_parity PRIVATE kernels artifact ${_gpu_runtime_target})
+add_test(NAME dec_moe_parity_nvfp4 COMMAND dec_moe_parity --nvfp4)   # synthetic experts: no GGUF needed
 if(BUILD_TESTING)
   # native expert pairs on synthetic ggml-quantized weights at 2560/640: GPU and CPU experts against the float
   # reference, GPU dequantizers against to_float.
@@ -754,6 +774,9 @@ if(BUILD_TESTING)
   # a pair without GPU kernels (Q6_K gate/up) is refused by native_expert_supported, not run
   add_test(NAME native_expert_parity_refuses_q6_K COMMAND native_expert_parity --synthetic q6_K/q8_0)
   set_tests_properties(native_expert_parity_refuses_q6_K PROPERTIES WILL_FAIL TRUE)
+  # NVFP4 on the CPU tier: AVX2/AVX-512 dots vs plain C, the expert with its tail scales vs a double reference
+  add_test(NAME native_expert_parity_nvfp4 COMMAND native_expert_parity --synthetic nvfp4/nvfp4 nvfp4/nvfp4)
+  set_tests_properties(native_expert_parity_nvfp4 PROPERTIES TIMEOUT 120)
 endif()
 # real-weight checks: test programs, not part of a release
 if(BUILD_TESTING)

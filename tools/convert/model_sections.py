@@ -330,6 +330,79 @@ class Experts:
                 yield np.concatenate([a[s:s + group] for a in arrays], axis=1).tobytes()
 
 
+NVFP4 = 40
+NVFP4_TAIL = 16          # per expert, after down: FP32 {s_gate, s_up, s_down, 0}
+
+
+def nvfp4_row_bytes(n: int) -> int:
+    """Bytes of one NVFP4 row of n values (blocks of 64 in 36 bytes)."""
+    if n % 64:
+        raise ConvertError(f"an NVFP4 row of {n} values is not whole blocks")
+    return n // 64 * 36
+
+
+class ExpertsPack:
+    """Routed experts from a native experts pack (`experts.bin` + `native_experts.txt`, Strata's "native experts v3"):
+        one blob per expert, gate | up | down rows and, for NVFP4, the 16-byte FP32 tail {s_gate, s_up, s_down, 0}.
+        The blobs are copied as they are; the tail moves with its expert through every tier."""
+
+    def __init__(self, src, n_embd: int, n_ff: int):
+        d = pathlib.Path(src)
+        self.bin, txt = d / "experts.bin", d / "native_experts.txt"
+        for p in (self.bin, txt):
+            if not p.is_file():
+                raise ConvertError(f"missing input: {p}")
+        head, rows = None, []
+        for line in txt.read_text(encoding="utf-8").splitlines():
+            if line.startswith("#"):
+                head = head or line
+            elif line.strip():
+                rows.append([int(x) for x in line.split()])
+        m = re.search(r"\(n_expert (\d+), total (\d+)", head or "")
+        if not m:
+            raise ConvertError(f"{txt}: no '(n_expert N, total T' in the header")
+        self.n_expert, self.total = int(m.group(1)), int(m.group(2))
+        self.n_layers = len(rows)
+        want = 2 * n_ff * nvfp4_row_bytes(n_embd) + n_embd * nvfp4_row_bytes(n_ff) + NVFP4_TAIL
+        self.layout, offset = [], 0
+        for i, r in enumerate(rows):
+            if len(r) != 5:
+                raise ConvertError(f"{txt}: malformed line {r}")
+            l, gt, dt, off, blob = r
+            if l != i or off != offset:
+                raise ConvertError(f"{txt}: layer {i} is missing or not contiguous")
+            if gt != NVFP4 or dt != NVFP4:
+                raise ConvertError(f"{txt}: layer {l} is type {gt}/{dt}; only NVFP4 ({NVFP4}) packs are supported")
+            if blob != want:
+                raise ConvertError(f"{txt}: layer {l} blob is {blob} B, NVFP4 {n_embd}x{n_ff} with its tail is {want}")
+            self.layout.append((l, gt, dt, off, blob))
+            offset += blob * self.n_expert
+        if offset != self.total or self.bin.stat().st_size != self.total:
+            raise ConvertError(f"{self.bin}: {self.bin.stat().st_size} B, the layout says {offset} (header {self.total})")
+
+    def layout_text(self) -> bytes:
+        head = ("# experts v6: layer gu_type d_type offset blob_bytes (n_expert %d, total %d); "
+                "an NVFP4 blob ends in FP32 {s_gate, s_up, s_down, 0}\n" % (self.n_expert, self.total))
+        return (head + "".join("%d %d %d %d %d\n" % x for x in self.layout)).encode("utf-8")
+
+    def chunks(self, group: int = 32):
+        """The blobs as stored, `group` experts at a time; every tail is checked (finite positive scales, last 0)."""
+        with self.bin.open("rb") as f:
+            for l, _, _, off, blob in self.layout:
+                f.seek(off)
+                for s in range(0, self.n_expert, group):
+                    n = min(group, self.n_expert - s)
+                    b = f.read(n * blob)
+                    if len(b) != n * blob:
+                        raise ConvertError(f"{self.bin}: short read in layer {l}")
+                    tail = np.frombuffer(b, dtype=np.uint8).reshape(n, blob)[:, blob - NVFP4_TAIL:]
+                    sc = tail.copy().view("<f4")
+                    if not (np.isfinite(sc).all() and (sc[:, :3] > 0).all() and (sc[:, 3] == 0).all()):
+                        bad = s + int(np.argmax(~(np.isfinite(sc).all(1) & (sc[:, :3] > 0).all(1) & (sc[:, 3] == 0))))
+                        raise ConvertError(f"{self.bin}: layer {l} expert {bad}: bad scale tail {sc[bad - s].tolist()}")
+                    yield b
+
+
 # ------------------------------------------------------------------ the drafter
 MTP_H, MTP_FF, MTP_NE = 2560, 640, 512
 MTP_EXPERTS = ("mtp.layers.0.mlp.experts.gate_up_proj", "mtp.layers.0.mlp.experts.down_proj")

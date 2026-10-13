@@ -245,6 +245,7 @@ path against the Q8_0 reference. Lower KLD and higher top-1 agreement are closer
 | UD-IQ3_XXS | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 79.4 GiB | 45.3 GiB | 2.564 | 0.244 | 87.0% |
 | UD-Q3_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 86.8 GiB | 52.0 GiB | 2.457 | 0.160 | 89.3% |
 | UD-Q4_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 106.7 GiB | 71.7 GiB | 2.321 | 0.068 | 93.0% |
+| NVFP4-GPTQ ([below](#nvfp4-pack)) | [Maximilian228](https://huggingface.co/Maximilian228/Qwen3.8-Flash-Next-NVFP4-GPTQ-Strata) experts, UD-Q4_K_XL rest | 98.3 GiB | 63.3 GiB | 2.292 | 0.088 | 92.5% |
 | Q8_0 | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 178.3 GiB | 119.5 GiB | 2.282 | reference | |
 
 The IQ3_S, IQ3_XXS and Q2_0 packs carry an MTP layer fine-tuned on the model's own output (self-distillation), which
@@ -252,6 +253,40 @@ raises draft acceptance. Output is unchanged, because verify decides every token
 MTP layer. `--mtp-dense FILE` embeds that tuned layer (the `mtp/dense` section's raw bytes, checked against the
 source layout) and records it as self-distilled, with its SHA-256, in `meta.mtp`. The tuned layer ships with the
 packs, inside the model file; the converter input is only needed to build a pack yourself.
+
+### NVFP4 pack
+
+The NVFP4-GPTQ pack is the UD-Q4_K_XL pack with only its routed experts replaced. The experts are NVFP4, quantized from
+Qwen's BF16 checkpoint by GPTQ ([Maximilian228/Qwen3.8-Flash-Next-NVFP4-GPTQ-Strata](https://huggingface.co/Maximilian228/Qwen3.8-Flash-Next-NVFP4-GPTQ-Strata)).
+Each block of 16 weights has E2M1 codes and a UE4M3 scale, and each expert has an FP32 scale per projection: 4.5 bits per
+weight, 63.3 GiB of experts against 71.7 GiB for UD-Q4_K_XL. Dense layers, PLE, the MTP drafter, the profile, vision and
+the tokenizer are Q4_K_XL's, byte for byte, so the two files differ only in the routed experts. Every tier runs it:
+the GPU kernels (decode and the MMQ prompt path), the peer card and the CPU tier.
+
+Quality is between UD-Q4_K_XL and UD-IQ4_XS. Against Q8_0 through the decode path (development measurement, 400 W):
+
+| pack | chunks | PPL | KLD mean | KLD p99 | same top-1 |
+|---|---:|---:|---:|---:|---:|
+| UD-Q4_K_XL | 20 | 2.322 | 0.0685 | 0.993 | 93.02% |
+| NVFP4-GPTQ | 20 | 2.292 | 0.0883 | 1.304 | 92.49% |
+| UD-Q4_K_XL | 100 | 3.320 | 0.0566 | 0.659 | 92.27% |
+| NVFP4-GPTQ | 100 | 3.312 | 0.0742 | 0.865 | 91.27% |
+
+Its KLD is about 30% higher than Q4_K_XL's and top-1 is 0.5 to 1 point lower. Its lower PPL is not a quality signal.
+What it buys is size: 8.4 GiB less of experts. Use it on a box with 64 GB of RAM or more, where it keeps more experts
+in RAM and on the GPUs than Q4_K_XL and so streams less from the SSD. When Q4_K_XL's experts already fit in RAM, use
+Q4_K_XL for quality.
+
+To build it, download `pack/experts.bin` and `pack/native_experts.txt` from the GPTQ repository and swap them into a
+UD-Q4_K_XL pack:
+
+```sh
+python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --experts-pack DIR/pack \
+    --out Qwen3.8-FN-NVFP4-GPTQ.basalt --name "Qwen3.8-FN NVFP4-GPTQ"
+```
+
+Every section but the experts is copied and checked by SHA-256 against the source pack, and `meta.experts_swap`
+records both inputs. How NVFP4 is computed on each tier: [docs/precision.md](docs/precision.md).
 
 ### Coder pack (expert-pruned)
 
