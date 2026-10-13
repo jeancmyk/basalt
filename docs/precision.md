@@ -13,7 +13,8 @@ tier, 32 GB of system RAM.
   and `--spec 7`.
 - **KLD matches llama.cpp.** On the same GGUFs against the same base, Basalt and llama.cpp's own `llama-perplexity`
   agree: IQ3_S 0.15264 vs 0.1526, IQ3_XXS 0.2433 vs 0.2428 at 100 chunks.
-- **No requantization.** Weights are the GGUF blocks as shipped. The one exception is the hyper-connection matrices,
+- **No requantization.** Weights are the GGUF blocks as shipped (the NVFP4 pack: the GPTQ pack's NVFP4 expert blobs,
+  also copied byte for byte). The one exception is the hyper-connection matrices,
   which decode reads from an int8 copy with one fp16 scale per 32 inputs.
 - **fp32 where it matters.** Activations are fp32 in the residual stream, norms, router, softmax and logits, and int8
   (q8_1) into the quantized matmuls. GDN state is fp32. KV is fp16 by default, with int8, q4_0 and k8v4 options.
@@ -32,6 +33,7 @@ hyper-connection streams, 48 layers (36 GDN, 12 QSA), 512 experts, top-10, head_
 | Tensor class | Format | Source |
 |---|---|---|
 | Routed experts | GGUF blocks copied byte for byte, no requantization. Gate and up share one type per layer; types are mixed across layers (IQ3_XXS pack: gate/up IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S; down Q2_0 on 30 layers, IQ4_NL on 18. IQ3_S pack: gate/up mostly IQ3_XXS, IQ3_S, IQ2_S, one IQ4_XS; down IQ4_NL on 39, Q2_0 on 9) | README.md (The `.basalt` model file); iq_kernels.cu:541-542; tests/data/native_experts/ |
+| Routed experts, NVFP4 pack | NVFP4 (type 40), copied byte for byte from a native experts pack (GPTQ from the BF16 checkpoint): per 16 weights, 8 bytes of E2M1 codes and one UE4M3 scale; per expert a 16-byte FP32 tail {s_gate, s_up, s_down, 0}. 4.5 bits per weight, all 48 layers. Every other section is UD-Q4_K_XL's | tools/convert/convert.py (swap_experts); native_experts.txt; iq_kernels.cu (nvfp4_scale_dev) |
 | Shared expert gate/up/down | GGUF blocks, any native_mmvq type | native_mmvq.hpp:55-58 |
 | Shared-expert scalar gate | BF16 | model_sections.py:48-51 |
 | QSA q/k/v/o, GDN qkv, z (attn_gate), ssm_out | GGUF blocks (dense_tc takes Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, Q3_K, Q2_0; native_mmvq otherwise) | dense_tc.cu:1063-1075; dense_tc.hpp:2-12 |
@@ -101,7 +103,7 @@ Prefill and decode are different computations that read and write the same KV an
 | hc matrices | Activations rounded to BF16; down/up use the int8 copy dequantized to BF16; inject uses the BF16 tensor | prefill.cpp:1500-1506; gemm.cu:136-159 |
 | Router | BF16 activation (decode: fp32) | prefill.cpp:1631 |
 | Shared expert | fp16 activation, fp16 SwiGLU | prefill.cpp:1634-1637 |
-| Routed experts | Fused int8 mma kernels, llama.cpp MMQ (q8_1) or dequant-to-fp16 cuBLAS | moe_fused_iq.hpp:1-12; moe_mmq.hpp:1-6 |
+| Routed experts | Fused int8 mma kernels, llama.cpp MMQ (q8_1) or dequant-to-fp16 cuBLAS; NVFP4 takes MMQ (see the Activations table) | moe_fused_iq.hpp:1-12; moe_mmq.hpp:1-6 |
 | Attention | fp16 mma with hi/lo split of q and p, fp32 accumulate | qsa_prompt_attn.hpp:1-22 |
 | Indexer scores | 3xTF32 tensor cores | qsa_select.hpp:36-38 |
 | GDN | State fp32; out-projection input fp16 | kernels.cu:609-623 |
@@ -186,6 +188,16 @@ At 20 chunks (Basalt: the README table; llama.cpp: its running value at chunk 20
 | GSQ-RCO IQ3_S | 0.177 / 89.4% | 0.1753 / 89.22% |
 | GSQ-RCO IQ3_XXS | 0.277 / 86.8% | 0.2780 / 86.65% |
 | UD-Q4_K_XL | 0.068 / 93.0% | 0.0579 / 93.96% |
+
+NVFP4-GPTQ and UD-Q4_K_XL in Basalt only (same harness and base, T 3, kv int8, `--mmap-experts`; a development
+measurement):
+
+| Pack | Chunks | PPL | KLD mean | KLD median | KLD p99 | Same top-1 |
+|---|---|---|---|---|---|---|
+| UD-Q4_K_XL | 100 | 3.3201 | 0.05656 | 0.01213 | 0.6586 | 92.27% |
+| NVFP4-GPTQ | 100 | 3.3119 | 0.07415 | 0.01524 | 0.8648 | 91.27% |
+| UD-Q4_K_XL | 20 | 2.3223 | 0.0685 | 0.00514 | 0.9928 | 93.02% |
+| NVFP4-GPTQ | 20 | 2.2922 | 0.0883 | 0.00646 | 1.3042 | 92.49% |
 
 IQ3_S and IQ3_XXS agree between the two engines to within 0.002 KLD and 0.2 points of top-1 at both chunk counts. The
 first 20 chunks read higher than the 100-chunk set (higher KLD and higher top-1 for the IQ3 packs), so the README table,
