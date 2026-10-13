@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import convert  # noqa: E402
 import model_sections as S  # noqa: E402
 from gguf_writer import GGUFWriter  # noqa: E402
-from model_file import ModelFile  # noqa: E402
+from model_file import ModelFile, ModelWriter  # noqa: E402
 
 N_EXPERT, N_LAYERS = 4, 2
 TOKENS = ["a", "b", "c", "d", "e", "f"]
@@ -263,6 +263,97 @@ class ConvertTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         for flag in ("--gguf", "--mtp-source", "--mtp-dense", "--mmproj", "--profile-from", "--profile ", "--hc8", "--draft-vocab"):
             self.assertIn(flag, r.stdout)
+
+
+class ExpertSwapTest(unittest.TestCase):
+    """--sections-from + --experts-pack on a tiny base file and an NVFP4 pack (H 128, FF 64, 2 layers x 4 experts)."""
+    H, FF = 128, 64
+    BLOB = 2 * 64 * (128 // 64 * 36) + 128 * (64 // 64 * 36) + 16
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = self.t = Path(self.tmp.name)
+        rng = np.random.default_rng(1)
+        w = ModelWriter(str(t / "base.basalt"))
+        self.base = {"tokenizer/vocab.json": b'{"a":0}', "dense": rng.bytes(5000), "experts": rng.bytes(777),
+                     "experts.layout": b"# experts v5: layer gu_type d_type offset blob_bytes (n_expert 4, total 777)\n"
+                                       b"0 12 7 0 1\n1 12 7 4 1\n",
+                     "gguf": rng.bytes(9000), "mtp/dense": rng.bytes(300), "profile": rng.bytes(64)}
+        for k, v in self.base.items():
+            w.add_bytes(k, v)
+        w.add_bytes("meta", json.dumps({"name": "Base", "gguf_kv": {"qwen.embedding_length": self.H,
+                                                                     "qwen.expert_feed_forward_length": self.FF}}).encode())
+        w.close()
+        self.pack = t / "pack"
+        self.pack.mkdir()
+        self.write_pack()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_pack(self, tail=(3e-5, 3e-5, 1e-4, 0.0), gu_type=40, blob=None):
+        blob = blob or self.BLOB
+        rng = np.random.default_rng(2)
+        raw = np.frombuffer(rng.bytes(2 * 4 * blob), dtype=np.uint8).reshape(8, blob).copy()
+        raw[:, blob - 16:] = np.array([tail] * 8, dtype="<f4").view(np.uint8)
+        self.bin = raw.tobytes()
+        (self.pack / "experts.bin").write_bytes(self.bin)
+        (self.pack / "native_experts.txt").write_text(
+            f"# strata native experts v3: layer gu_type d_type offset blob_bytes (n_expert 4, total {len(self.bin)})\n"
+            f"0 {gu_type} 40 0 {blob}\n1 {gu_type} 40 {4 * blob} {blob}\n")
+
+    def run_swap(self, **kw):
+        d = dict(sections_from=str(self.t / "base.basalt"), experts_pack=str(self.pack), out=str(self.t / "out.basalt"),
+                 name="Tiny NVFP4", force=False)
+        d.update(kw)
+        convert.swap_experts(type("A", (), d)())
+        return ModelFile(str(self.t / "out.basalt"))
+
+    def test_round_trip(self):
+        m = self.run_swap()
+        self.assertEqual(m.names(), list(self.base) + ["meta"])
+        for k in m.names():
+            self.assertTrue(m.verify(k), k)
+        for k, v in self.base.items():
+            if k not in ("experts", "experts.layout"):
+                self.assertEqual(m.read(k), v, k)
+        self.assertEqual(m.read("experts"), self.bin)
+        lines = m.read("experts.layout").decode().splitlines()
+        self.assertTrue(lines[0].startswith(f"# experts v6: layer gu_type d_type offset blob_bytes "
+                                            f"(n_expert 4, total {len(self.bin)})"))
+        self.assertEqual(lines[1:], [f"0 40 40 0 {self.BLOB}", f"1 40 40 {4 * self.BLOB} {self.BLOB}"])
+        meta = json.loads(m.read("meta"))
+        self.assertEqual(meta["name"], "Tiny NVFP4")
+        self.assertEqual(meta["gguf_kv"]["qwen.embedding_length"], self.H)
+        self.assertEqual(meta["experts_swap"]["sections_from"]["path"], "base.basalt")
+        self.assertEqual(meta["experts_swap"]["experts_pack"]["bytes"], len(self.bin))
+
+    def test_bad_tail_is_refused(self):
+        self.write_pack(tail=(3e-5, float("nan"), 1e-4, 0.0))
+        with self.assertRaises(SystemExit):
+            self.run_swap()
+        self.assertFalse((self.t / "out.basalt").exists())
+        self.assertFalse((self.t / "out.basalt.partial").exists())
+
+    def test_wrong_type_or_blob_is_refused(self):
+        self.write_pack(gu_type=12)
+        with self.assertRaises(SystemExit):
+            self.run_swap()
+        self.write_pack(blob=self.BLOB - 16)          # no tail
+        with self.assertRaises(SystemExit):
+            self.run_swap()
+
+    def test_cli_needs_both_and_nothing_else(self):
+        c = [sys.executable, str(Path(convert.__file__)), "--out", str(self.t / "x.basalt")]
+        r = subprocess.run(c + ["--experts-pack", str(self.pack)], capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        r = subprocess.run(c + ["--experts-pack", str(self.pack), "--sections-from", str(self.t / "base.basalt"),
+                                "--gguf", "a.gguf"], capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        r = subprocess.run(c + ["--experts-pack", str(self.pack), "--sections-from", str(self.t / "base.basalt")],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(ModelFile(str(self.t / "x.basalt")).read("experts"), self.bin)
 
 
 class DrafterTest(unittest.TestCase):

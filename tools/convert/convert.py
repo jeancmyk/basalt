@@ -3,6 +3,7 @@
     python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPROJ.gguf --out MODEL.basalt \\
         [--mtp-source DIR] [--mtp-dense FILE] [--profile FILE | --profile-from TRACE ...] [--draft-vocab FILE] [--hc8 FILE] \\
         [--name NAME] [--compat-bf16] [--no-vision] [--force]
+    python3 tools/convert/convert.py --sections-from BASE.basalt --experts-pack DIR --out MODEL.basalt [--name NAME] [--force]
 
 Inputs
   --gguf FILE        the model's GGUF: shard 1 of a split model (the others are found beside it) or --gguf per shard
@@ -15,6 +16,12 @@ Inputs
   --profile-from TRACE ...  `--dump-routing` traces: routed experts first, most frequent first, then the rest;
                      with neither option the ranking is the plain fill order
   --hc8 FILE         8-bit hyper-connection copies from `--dump-hc8`; without them the engine quantizes at every start
+
+Expert swap (the second form)
+  --sections-from BASE.basalt  every section but `experts`/`experts.layout` is copied byte for byte (meta gains
+                     `experts_swap`), so a comparison with BASE differs only in the routed experts
+  --experts-pack DIR a native experts pack (experts.bin + native_experts.txt, NVFP4 type 40); each blob keeps its
+                     16-byte FP32 tail {s_gate, s_up, s_down, 0} and the layout is written as v6
 
 Options
   --name NAME        the model's name, reported by the server
@@ -32,6 +39,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -43,7 +51,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))   # for model_file, gguf_reader, tokenizer
 import model_sections as S  # noqa: E402
-from model_file import TENSOR_ALIGN, ModelWriter  # noqa: E402
+from model_file import TENSOR_ALIGN, ModelFile, ModelWriter  # noqa: E402
 
 FINGERPRINT_BYTES = 64 << 20
 
@@ -288,9 +296,85 @@ def convert(a) -> None:
     print(f"done: {len(job.rows)} sections, {total / (1 << 30):.3f} GiB, {time.time() - job.t0:.1f} s -> {out}")
 
 
+def kv_suffix(kv: dict, suffix: str) -> int:
+    hits = [v for k, v in kv.items() if k.endswith(suffix)]
+    if len(hits) != 1:
+        die(f"the source pack's metadata has {len(hits)} keys ending in {suffix}")
+    return int(hits[0])
+
+
+def swap_experts(a) -> None:
+    """A copy of --sections-from with its routed experts replaced by --experts-pack's: every other section (dense,
+    PLE, drafter, profile, vision, tokenizer) is copied byte for byte, so the two files differ only in the experts."""
+    out, src = Path(a.out), Path(a.sections_from)
+    partial = Path(str(out) + ".partial")
+    if out.exists() and not a.force:
+        die(f"{out} exists (use --force to overwrite)")
+    if not src.is_file():
+        die(f"missing input: {src}")
+    base = ModelFile(str(src))
+    meta = json.loads(base.read("meta"))
+    old = base.read("experts.layout").decode("utf-8").splitlines()
+    m = re.search(r"\(n_expert (\d+)", old[0])
+    n_layers = sum(1 for x in old if x.strip() and not x.startswith("#"))
+    try:
+        pack = S.ExpertsPack(a.experts_pack, kv_suffix(meta["gguf_kv"], ".embedding_length"),
+                             kv_suffix(meta["gguf_kv"], ".expert_feed_forward_length"))
+    except S.ConvertError as e:
+        die(str(e))
+    if not m or int(m.group(1)) != pack.n_expert or n_layers != pack.n_layers:
+        die(f"{src} has {n_layers} layers of {m.group(1) if m else '?'} experts, the pack {pack.n_layers} of "
+            f"{pack.n_expert}")
+    if partial.exists():
+        partial.unlink()
+    w = ModelWriter(str(partial))
+    job = Job(w)
+    ok = False
+    try:
+        print("writing sections:", flush=True)
+        for name in base.names():
+            if name == "experts":
+                job.chunks(name, pack.chunks())
+            elif name == "experts.layout":
+                job.bytes(name, pack.layout_text())
+            elif name != "meta":
+                off, size = base.section(name)
+                job.file(name, src, off, size)
+        for name, _, _, digest in w.entries:
+            if name not in ("experts", "experts.layout") and digest != base.sections[name][2]:
+                die(f"section {name}: the copy's SHA-256 differs from {src}'s")
+        pack_dir = Path(a.experts_pack)
+        meta["name"] = a.name or meta.get("name")
+        meta["converter"] = {"tool": "tools/convert/convert.py", "git": git_rev()}
+        meta["experts_swap"] = {
+            "sections_from": {"path": src.name, "size": src.stat().st_size, "fingerprint_sha256_first_last_64mib_and_size":
+                              fingerprint(src)},
+            "experts_pack": {"path": pack_dir.name, "bytes": pack.total,
+                             "layout_sha256": hashlib.sha256((pack_dir / "native_experts.txt").read_bytes()).hexdigest()},
+            "format": "nvfp4", "tail": "fp32 {s_gate, s_up, s_down, 0} per expert"}
+        job.bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        w.close()
+        ok = True
+    except S.ConvertError as e:
+        die(str(e))
+    finally:
+        if not ok:
+            try:
+                w.f.close()
+            except OSError:
+                pass
+            partial.unlink(missing_ok=True)
+    os.replace(partial, out)
+    print(f"done: {len(job.rows)} sections, {out.stat().st_size / (1 << 30):.3f} GiB, {time.time() - job.t0:.1f} s -> {out}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--gguf", required=True, action="append", metavar="FILE",
+    ap.add_argument("--sections-from", metavar="PACK.basalt",
+                    help="copy every section but the routed experts from this .basalt (needs --experts-pack)")
+    ap.add_argument("--experts-pack", metavar="DIR",
+                    help="routed experts from a native experts pack: experts.bin + native_experts.txt (NVFP4)")
+    ap.add_argument("--gguf", action="append", metavar="FILE",
                     help="the model's GGUF: shard 1 of a split model (the others are found beside it), or repeat per shard")
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")
     ap.add_argument("--out", required=True, help="the .basalt file to write")
@@ -301,12 +385,22 @@ def main():
     ap.add_argument("--profile-from", nargs="+", metavar="TRACE",
                     help="routing traces from `basalt generate --dump-routing`: the ranking is built from them")
     ap.add_argument("--hc8", metavar="FILE", help="file written by `basalt generate --model ... --dump-hc8`")
-    ap.add_argument("--name", default="Qwen3.8-Flash-Next IQ3_XXS")
+    ap.add_argument("--name")
     ap.add_argument("--compat-bf16", action="store_true",
                     help="convert small projections stored in another form to BF16 (rounds)")
     ap.add_argument("--no-vision", action="store_true")
     ap.add_argument("--force", action="store_true", help="overwrite --out")
     a = ap.parse_args()
+    if a.sections_from or a.experts_pack:
+        if not (a.sections_from and a.experts_pack):
+            ap.error("--sections-from and --experts-pack go together")
+        if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.profile or a.profile_from or a.hc8:
+            ap.error("--sections-from copies everything but the experts; give no other inputs")
+        swap_experts(a)
+        return
+    if not a.gguf:
+        ap.error("--gguf is required")
+    a.name = a.name or "Qwen3.8-Flash-Next IQ3_XXS"
     if not a.no_vision and not a.mmproj:
         ap.error("--mmproj is required unless --no-vision")
     convert(a)
