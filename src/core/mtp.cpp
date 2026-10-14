@@ -4,6 +4,7 @@
 #include "basalt/core/coupled_draft.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
+#include "basalt/core/kv_arena.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/on_device.hpp"
 
@@ -28,6 +29,7 @@
 #include "basalt/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/qsa_dec_fused.hpp"
 #include "basalt/kernels/q5k_head.hpp"
+#include "basalt/kernels/q6k_head.hpp"
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/kernels/rope.hpp"
 #include "basalt/kernels/router_top10.hpp"
@@ -341,6 +343,10 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     const bool kv_int8_was = qsa_kv_int8();
     qsa_set_kv_hybrid(false);
     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
+    // the draft K/V is elastic like the layers' (its arena grows and shrinks with the session's), except where a
+    // store per batch slot copies whole pools
+    const int64_t kv_elastic_was = qsa_kv_elastic();
+    if (n_stores_ > 0) qsa_set_kv_elastic(0);
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
@@ -356,6 +362,8 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     }
     qsa_set_kv_int8(kv_int8_was);
     qsa_set_kv_hybrid(kv_hybrid_was);
+    qsa_set_kv_elastic(kv_elastic_was);
+    if (st_.kv_arena != nullptr) ss.kv_extra.push_back(st_.kv_arena);
     qsa_state_zero(st_, g, nullptr);
     cudaDeviceSynchronize();
     vram_ += sb;
@@ -385,7 +393,12 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
                 }
         }
     }
-    LoadProgress::kv(LoadProgress::cuda(device_), draft_kv_bytes, max_cells, "draft");
+    uint64_t draft_kv_max = draft_kv_bytes;
+    if (st_.kv_arena != nullptr) {   // the elastic working K/V: what is backed now, and what the whole context takes
+        draft_kv_bytes += st_.kv_arena->mapped_bytes();
+        draft_kv_max += st_.kv_arena->bytes_for(st_.kv_arena->max_cells());
+    }
+    LoadProgress::kv(LoadProgress::cuda(device_), draft_kv_bytes, max_cells, "draft", draft_kv_max);
 
     // ---- buffers
     window_ = (window > 0 && window < max_cells) ? window : 0;
@@ -659,12 +672,13 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             std::fprintf(stderr, "basalt mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
             n_tier1_ = n_base + n_xcap_;
-            if (head->type() == 13) {   // the 2-bit copy of the leading rows scores them in a third of the bytes
+            if (head->type() == 13 || head->type() == 14) {   // the 2-bit copy of the leading rows: a fraction of the bytes
                 const size_t pb = basalt::kernels::q5k_proxy_bytes(n_tier1_);
                 const size_t sb = basalt::kernels::q5k_proxy_scratch_bytes(n_tier1_);
                 if (cudaMalloc((void**) &proxy_, pb) == cudaSuccess && cudaMalloc(&proxy_scratch_, sb) == cudaSuccess) {
                     cudaMemset(proxy_, 0, pb);
-                    basalt::kernels::q5k_proxy_pack(dhead_, 0, n_tier1_, proxy_, n_tier1_, nullptr);
+                    if (head->type() == 13) basalt::kernels::q5k_proxy_pack(dhead_, 0, n_tier1_, proxy_, n_tier1_, nullptr);
+                    else basalt::kernels::q6k_proxy_pack(dhead_, 0, n_tier1_, proxy_, n_tier1_, nullptr);
                     cudaDeviceSynchronize();
                     vram_ += pb + sb;
                 } else {
@@ -993,8 +1007,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         // The head, its argmax and the argmax's probability in one launch (the probability's sum in
         // another order: last bits)
         if (!coupled_rec_ && T == 1 && sub && proxy_ != nullptr && nv == n_tier1_ && diag_ == nullptr &&
-            basalt::kernels::q5k_proxy_top1(proxy_, dhead_, xq_, (int) nv, n_tier1_, dvocab_, out_ids_, probs_,
-                                            proxy_scratch_, cs))
+            (head_->type() == 13
+                 ? basalt::kernels::q5k_proxy_top1(proxy_, dhead_, xq_, (int) nv, n_tier1_, dvocab_, out_ids_, probs_,
+                                                   proxy_scratch_, cs)
+                 : basalt::kernels::q6k_proxy_top1(proxy_, dhead_, xq_, (int) nv, n_tier1_, dvocab_, out_ids_, probs_,
+                                                   proxy_scratch_, cs)))
             return true;
         if (!coupled_rec_ && T == 1 && head_->type() == 13 && top_scratch_ != nullptr && diag_ == nullptr &&
             q5k_head_top1(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, sub ? dvocab_ : nullptr,

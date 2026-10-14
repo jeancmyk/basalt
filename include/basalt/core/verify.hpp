@@ -146,8 +146,13 @@ public:
     /// parameters would otherwise be baked forever - so this can change between requests freely.
     void set_sampling(const basalt::kernels::SamplerParams& sp) {
         sampling_ = sp;   // row t of a window at pos0 draws Philox(seed, pos0 + t): see run()
+        sampling_.logit_bias = logit_bias_host_.empty() ? nullptr : logit_bias_device_;
         if (next_) next_->set_sampling(sp);
     }
+    /// One request's token bias (one float per vocabulary entry, added to the logits before the sampler chain); empty
+    /// clears it.  Applies to this verifier's own sampling only: the drafter never sees it.  Call before set_sampling;
+    /// copied to the final stage's device only when it changed.
+    bool set_logit_bias(const std::vector<float>& bias, std::string& err);
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len` int32
     /// slots at that stride (`basalt::kernels::penalty_rows` builds them), most recent token LAST, unused front slots
@@ -163,6 +168,11 @@ public:
     /// discarded - a prompt read through windows commits every token - so they cost no sampler launch or sync and
     /// never read a history staged for another position.
     void set_head_sampling(bool on) { head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
+    /// On: a sampled window also leaves draft_prob(t), the probability row t's final distribution gives the window's
+    /// token t + 1 (t < T - 1), for relaxed acceptance.  The picks are unchanged.  Off by default; set per request.
+    void set_draft_probe(bool on) { draft_probe_ = on; if (next_) next_->set_draft_probe(on); }
+    /// Valid after a sampled run() with the probe on.
+    float draft_prob(int t) const { return next_ ? next_->draft_prob(t) : ((volatile float*) h_qp_)[t]; }
 
     /// LAYER SPLIT (multi-GPU): this verifier runs layers [layer_begin, layer_end) of every window.  A stage that
     /// does not start at layer 0 takes its residual from `handoff_in` instead of embedding the tokens; a stage that
@@ -370,6 +380,9 @@ private:
     const int32_t* hist_d_ = nullptr;   // penalty-history row (set_history); null = no penalties apply
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
+    bool draft_probe_ = false;           ///< set_draft_probe
+    std::vector<float> logit_bias_host_;
+    float* logit_bias_device_ = nullptr;
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     std::atomic<bool> released_{false};   // release_gpu_waits ran (maybe on the watchdog thread): no more windows
     bool all_resident_ = false;           ///< 100% of experts in [lb_, le_) resident in VRAM: zero-doorbell graph
@@ -439,6 +452,8 @@ private:
     int32_t* h_commit_ = nullptr; int32_t* m_commit_ = nullptr; // [n_keep, n_keep-1, pos_0 .. pos_{T-1}]
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
+    int32_t* h_q_ = nullptr;     int32_t* m_q_ = nullptr;       // the probe's tokens: the window's drafts
+    float* h_qp_ = nullptr;      float* m_qp_ = nullptr;        // the probe's probabilities
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
@@ -489,6 +504,7 @@ private:
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
+    uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead)
     uint16_t* sh_bf16_ = nullptr;
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM

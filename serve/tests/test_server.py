@@ -1033,6 +1033,13 @@ class SamplingKeys(unittest.TestCase):
         for bad in (-1, True, 2.5, "20"):
             self.assertFalse([k for k in self.keys(temperature=0.7, top_k=bad) if k.startswith("top_k=")], bad)
 
+    def test_relaxed_drafting(self):
+        self.assertIn("relax=0.3", self.keys(temperature=1.0, relaxed_drafting=0.3))
+        self.assertIn("relax=0", self.keys(temperature=1.0, relaxed_drafting=False))
+        self.assertIn("relax=0.0", self.keys(temperature=1.0, relaxed_drafting=0))
+        for bad in (True, 1.5, -0.1, "0.3", None):
+            self.assertFalse([k for k in self.keys(temperature=1.0, relaxed_drafting=bad) if k.startswith("relax")], bad)
+
     def test_penalty_window(self):
         self.assertIn("penalty_last_n=64", self.keys(presence_penalty=1.5))
         self.assertIn("penalty_last_n=4096", self.keys(repetition_penalty=1.1, penalty_last_n=4096))
@@ -1463,6 +1470,7 @@ class StartFailureLog(unittest.TestCase):
         svc = Service.__new__(Service)
         svc.engine, svc.vision, svc.before_load, svc.min_free_vram_mib = eng, None, None, 0
         svc.vram_reserve = None
+        svc.stopping = threading.Event()
         out = io.StringIO()
         with mock.patch.object(Service, "loaded", lambda self: False), \
                 mock.patch.object(Service, "_vision_down", lambda self: False), \
@@ -1601,9 +1609,10 @@ class LoadProgress(unittest.TestCase):
 
     def test_kv_is_a_line_after_the_result_and_not_a_load(self):
         from serve.engine.progress import LoadBars, load_kv, load_progress
-        self.assertEqual(load_kv("basalt load: kv cuda0 4509715660 262144"), ("cuda0", 4509715660, 262144, ""))
-        self.assertEqual(load_kv("basalt load: kv slot cuda1 100 5"), ("cuda1", 100, 5, "slot"))
-        self.assertEqual(load_kv("basalt load: kv draft cuda0 100 5"), ("cuda0", 100, 5, "draft"))
+        self.assertEqual(load_kv("basalt load: kv cuda0 4509715660 262144"), ("cuda0", 4509715660, 262144, "", 4509715660))
+        self.assertEqual(load_kv("basalt load: kv slot cuda1 100 5"), ("cuda1", 100, 5, "slot", 100))
+        self.assertEqual(load_kv("basalt load: kv slot cuda1 100 5 900"), ("cuda1", 100, 5, "slot", 900))
+        self.assertEqual(load_kv("basalt load: kv draft cuda0 100 5"), ("cuda0", 100, 5, "draft", 100))
         self.assertIsNone(load_kv("basalt load: kv cuda0 x 1"))
         self.assertIsNone(load_kv("basalt load: kv other cuda0 1 2"))
         self.assertIsNone(load_progress("basalt load: kv cuda0 100 5"))
@@ -1628,6 +1637,17 @@ class LoadProgress(unittest.TestCase):
         self.assertEqual(bars.kv_lines(), [
             "[server] kv cache: 12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)",
             "[server] kv cache: 1.0 GiB on cuda3 (1 slot x 1000 tokens)"])
+
+    def test_an_elastic_kv_line_reads_backed_over_most(self):
+        from serve.engine.progress import LoadBars, load_kv
+        bars = LoadBars(io.StringIO(), gpus=[2, 3])
+        bars.set_kv(*load_kv("basalt load: kv cuda0 536870912 262144 4294967296"))
+        bars.set_kv(*load_kv("basalt load: kv draft cuda0 107374182 262144 429496729"))
+        self.assertEqual(bars.kv_lines(), ["[server] kv cache: 0.6 / 4.4 GiB on cuda2 (elastic)"])
+        slots = LoadBars(io.StringIO())
+        slots.set_kv("cuda0", 1 << 29, 262144, "slot", 4 << 30)
+        slots.set_kv("cuda0", 1 << 29, 262144, "slot", 4 << 30)
+        self.assertEqual(slots.kv_lines(), ["[server] kv cache: 1.0 / 8.0 GiB on cuda0 (elastic, 2 slots)"])
 
     def test_a_target_planned_empty_shows_nothing(self):
         from serve.engine.progress import LoadBars
@@ -1679,7 +1699,7 @@ class LoadProgress(unittest.TestCase):
 
     def test_narrator_shows_the_ram_floor_line(self):
         from serve.engine.progress import engine_ram_floor, narrate_start
-        text = "9.3 GiB (2.0 margin + 7.3 file cache): 20.0 GiB of experts are read from the SSD; the RAM copy takes at most 12.0 of 30.0 GiB available"
+        text = "9.3 GiB (2.0 margin + 7.3 cache), 20.0 GiB experts on SSD, RAM copy <= 12.0 of 30.0 GiB"
         self.assertEqual(engine_ram_floor("basalt generate: RAM floor " + text), text)
         self.assertIsNone(engine_ram_floor("basalt generate: RAM floor "))
         self.assertIsNone(engine_ram_floor("basalt generate: session is up"))
@@ -2594,8 +2614,8 @@ class StatusHandover(unittest.TestCase):
             def __init__(self):
                 self.lock, self.armed = threading.Lock(), False
 
-            def acquire(self, blocking=True):
-                return self.lock.acquire(blocking)
+            def acquire(self, blocking=True, timeout=-1):
+                return self.lock.acquire(blocking, timeout)
 
             def __enter__(self):
                 self.lock.acquire()

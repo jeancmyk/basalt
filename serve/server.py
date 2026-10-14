@@ -56,7 +56,7 @@ def warn_tight_ram(arena_mib) -> None:
         return
     left = total / 2**30 - arena_mib / 1024
     if left < 6:
-        print(f"[server] warning: low RAM, {left:.1f} of {total / 2**30:.0f} GB left after the experts", flush=True)
+        print(f"[server] warning: low RAM: {left:.1f} of {total / 2**30:.0f} GB left after experts", flush=True)
 
 
 def main() -> int:
@@ -239,7 +239,7 @@ def main() -> int:
             time.sleep(1)                               # a timed wait keeps Ctrl+C deliverable
     except KeyboardInterrupt:
         print("[server] stopping (Ctrl+C again to force)", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None]
+        closers = [svc.stop, httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None]
         for close in filter(None, closers):
             try:
                 close()

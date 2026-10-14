@@ -23,6 +23,7 @@ import threading
 import time
 from pathlib import Path
 
+from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStuck
 from serve.engine.slots import AdmissionQueue
 from serve.engine.progress import narrate_start, start_errors, start_failure_hint, start_last_line
@@ -476,7 +477,13 @@ class ProcessEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
-        return keys + ProcessEngine.projection_key(sampling)
+        # relaxed_drafting: this request's --relaxed-drafting threshold, 0 or false for exact sampling
+        rd = sampling.get("relaxed_drafting")
+        if rd is False:
+            keys += " relax=0"
+        elif isinstance(rd, (int, float)) and not isinstance(rd, bool) and 0.0 <= float(rd) <= 1.0:
+            keys += f" relax={float(rd)!r}"
+        return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -722,10 +729,12 @@ class ProcessEngine:
         with self.slot_cv:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
 
-    def _shorter_waiting(self, plen: int) -> bool:
-        """A waiting prompt under half this length is worth giving way to."""
+    def _shorter_waiting(self, plen: int, free: int = 1) -> bool:
+        """A waiting prompt under half this length is worth giving way to, when `free` slots are free (the one it
+        will run in, and the one the read waits in if it holds none yet)."""
         with self.slot_cv:
-            return any(e[0] * 2 <= plen for e in self.wait_lens)
+            return (sum(1 for b in self.slot_busy if not b) >= free and
+                    any(e[0] * 2 <= plen for e in self.wait_lens))
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
         """--batch: run solo (GEN) while alone, move to a batch slot (BGEN) when others arrive, and return to solo
@@ -794,7 +803,7 @@ class ProcessEngine:
                             yield t
                         if x is None:                       # heartbeat
                             if (not yield_sent and not out and not embeddings and yields < self.YIELDS_MAX and
-                                    self._shorter_waiting(len(prompt))):
+                                    self._shorter_waiting(len(prompt), 2 if solo_slot is None else 1)):
                                 if solo_slot is None:
                                     with self.slot_cv:      # slot the partial read will wait in
                                         reserved = self.pick_slot(prompt)
@@ -838,12 +847,23 @@ class ProcessEngine:
                                         self.slot_busy[slot] = True
                                         break
                                     slot = None
+                                    if holding:
+                                        # never wait for a slot holding the control lines: a read that gave way
+                                        # waits in its slot for them, and only its end frees that slot
+                                        self.ctl.release()
+                                        holding = False
+                                        self.slot_cv.notify_all()
                                     self.slot_cv.wait(timeout=10.0)
                                     if cancel.is_set():
                                         return
                             finally:
                                 self.admission.leave(ticket)
                                 self.slot_cv.notify_all()
+                    if not holding:                         # waited for the slot: take the control lines again
+                        ok = yield from self._take_control(cancel, len(prompt))
+                        if not ok:
+                            return
+                        holding, born = True, self.gen
                     if self._yielded is not None:           # gave way: waiting requests go first
                         self.slot_held[slot] = list(prompt[:self._yielded[1]])
                         self._yielded = None

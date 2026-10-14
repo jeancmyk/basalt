@@ -16,7 +16,8 @@ from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
 from serve.engine.errors import EngineDied, EngineStarting, EngineStuck, GpuBusy, ModelBusy
-from serve.frontend import anthropic_to_messages, openai_to_messages
+from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bias
+from serve.frontend import anthropic_to_messages, forced_call, openai_to_messages
 from serve.api.openai import openai_chunks, openai_collect, structured_chunks
 from serve.api.responses import ResponsesError
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed
@@ -496,18 +497,22 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             messages, tools, kw = openai_to_messages(req)
+            tools, force = forced_call(req.get("tool_choice"), tools)   # a bad choice is a 400 before streaming
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and tools:
                 raise ValueError("structured response_format with tools is not supported")
+            if validator is not None:
+                req["relaxed_drafting"] = False                # JSON output is sampled exactly
             svc.load()
+            req[BIAS_KEY] = checked_bias(req, svc.engine)     # a bad logit_bias is a 400 before streaming
             max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             stop_strings(req)                                 # likewise a bad stop
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel)
+            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
             if not req.get("stream"):
@@ -537,7 +542,7 @@ def make_handler(svc: Service):
         def _responses(self, req):
             """POST /v1/responses (serve/api/responses.py); after the stream starts, errors are response.failed."""
             try:
-                ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req)
+                ids, thinking, tools, max_new, asm, validator, req, force = self._responses_prepare(req)
             except ResponsesError as e:
                 return self._json(e.status, e.body())
             except ModelBusy as e:
@@ -553,7 +558,7 @@ def make_handler(svc: Service):
             def events():
                 yield from asm.start()
                 done = None
-                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
                     if kind == "ping":
                         yield None
                     elif kind == "event":
@@ -617,6 +622,10 @@ def make_handler(svc: Service):
             responses_api.check_request(req)
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
+            try:
+                tools, force = forced_call(req.get("tool_choice"), tools)
+            except ValueError as e:
+                raise ResponsesError(str(e), "tool_choice") from None
             kw = responses_api.template_kwargs(req)
             try:
                 messages, validator = prepare_format(responses_api.text_format(req), messages)
@@ -625,6 +634,8 @@ def make_handler(svc: Service):
             if validator is not None and tools:
                 raise ResponsesError("a JSON text.format with tools is not supported", "text.format",
                                      "unsupported_parameter")
+            if validator is not None:
+                req["relaxed_drafting"] = False                # JSON output is sampled exactly
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # once per tool
             if set(skipped) - noted:
                 print(f"[server] warning: /v1/responses ignores hosted tools {', '.join(sorted(set(skipped) - noted))}", flush=True)
@@ -639,7 +650,7 @@ def make_handler(svc: Service):
                 raise ResponsesError(str(e), "stop") from None
             svc.load()
             try:
-                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0)
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0, force=force)
             except ResponsesError:
                 raise
             except ValueError as e:                          # too long for the context, or an image without vision
@@ -649,25 +660,27 @@ def make_handler(svc: Service):
             include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, svc.model, len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
-            return ids, thinking, tools, max_new, asm, validator, req
+            return ids, thinking, tools, max_new, asm, validator, req, force
 
         def _count_tokens(self, req):
             """Anthropic's token count: the rendered, tokenized prompt, without running the model."""
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            tools, _ = forced_call(req.get("tool_choice"), tools)   # same 400 as the request itself ("none": no tools)
             stop_strings(req)                                 # same 400 as the request itself
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
             svc.load()
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            tools, force = forced_call(req.get("tool_choice"), tools)   # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             stop_strings(req)                                 # likewise a bad stop
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
+            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
             self._sse()
@@ -695,6 +708,7 @@ def make_handler(svc: Service):
 
 class Server(ThreadingHTTPServer):
     allow_reuse_address = True
+    request_queue_size = 256      # socketserver's backlog of 5 resets some clients of a burst of simultaneous connections
 
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a hang-up needs no stack trace

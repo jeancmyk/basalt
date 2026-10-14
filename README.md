@@ -8,7 +8,7 @@
 Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model. It targets one thing:
 Linux with an NVIDIA Blackwell GPU (sm_120). The experts that do not fit in VRAM live in system RAM (and optionally on
 a second GPU used as a peer expert tier), so a large MoE model runs on a single workstation.
-Ready-to-run `.basalt` packs are on [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt).
+Ready-to-run `.basalt` packs: see [Models](#models).
 
 It is a fork of [Strata](https://github.com/Niko1221/Strata) (MIT), stripped down to that one target. See
 [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).
@@ -119,13 +119,23 @@ each slot has. `--slot-full-context` (also `"slot-full-context"` in the config's
 the whole `--max-context` instead, at N times the KV cache; the startup line says so. The slots' KV cache, and one
 solo session of the same length, come out of the expert cache.
 
+On one GPU (not with `--kv-resident` or `--vram-elastic`) the KV cache is elastic: each session backs its first 32768
+cells at startup (the K/V pools, the indexer's block keys, the RoPE tables and the draft layer's K/V alike), and the
+rest of that VRAM holds the expert cache's last slots until a request needs it. A request backs its prompt plus 16384 cells before the prompt is read (and 16384 more whenever decode runs past that) by taking
+those slots back; their experts become CPU misses read from their RAM copies, which the RAM copy keeps for exactly this.
+The next request that needs less gives the cells back and the cache refills the slots from RAM. A short request so
+decodes with the cache a 32k context would have, whatever `--max-context` is. The startup line `elastic KV: ...` says
+how much of the cache is lent this way, and each move is logged (`elastic KV: N cells backed ...`).
+
 While other slots are decoding, a new prompt is read beside them: the prompt path runs on its own thread, the slots'
 decode windows keep running (their kernels take the higher stream priority), and the few steps that touch the draft
 layer or the output run between two windows. A long prompt therefore does not stop the other requests. A prompt that
 arrives while no other slot is decoding is read as in the single-stream path.
 
 At startup the server prints one `[server] kv cache:` line per device with all the session state placed there, for
-example `12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)`. Because that memory is
+example `12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)`. With elastic KV (the
+default on one GPU) it reads `0.6 / 4.4 GiB on cuda0 (elastic)`: the memory backed at startup, and what the cache can
+grow to at `--max-context`. Because that memory is
 taken from the expert cache, the engine warns (`basalt warning: the N batch slots' sessions ... take X GiB of CUDA0
 ...`) when it leaves the cache short of the expert set, or at under half of what it would hold without the slots, and
 names the remedies: a smaller `--max-context`, no `--slot-full-context`, fewer `--parallel` slots. If a slot's session
@@ -141,6 +151,14 @@ the slots that did fit; if fewer than two fit, `--batch is off` and the server r
 - Precedence: command line > config file > built-in defaults. `spec`, `spec-min-p`, `mtp-max-t`, `peer-exclusive` and
   `max-context` are engine flags; they are also server flags on the command line.
 - The API key is command line only (`--api-key`); a config file that sets it is refused.
+- `"relaxed-drafting": 0.3` (or `true` for the default 0.5; `--relaxed-drafting [P]` on the command line) trades
+  exactness for speed under sampling: a draft the model gives probability P or more is kept even when the model's own
+  draw would have been another token. Lower P is faster and further from the model's true sampling distribution; the
+  measured speed and cost per value are in [docs/precision.md](docs/precision.md#relaxed-drafting). Off by default:
+  without it, speculative decoding returns exactly what plain sampling would. Greedy (temperature 0) requests,
+  `logit_bias`, JSON `response_format`, control tokens and everything inside a tool call stay exact. A request can set
+  its own value with `"relaxed_drafting": P` (or `false` for exact). Single-stream decoding only; `--parallel` slots
+  stay exact.
 - The startup line `[server] engine: ...` lists the settings that came from the file or the command line; without
   `--config` it says the built-in defaults apply.
 
@@ -148,9 +166,9 @@ the slots that did fit; if fewer than two fit, `--batch is off` and the server r
 
 A prompt is read in chunks. `--prefill auto` (the usual setting) takes the largest chunk whose buffers the expert cache
 can lend: the buffers are carved from the cache's last slots for the length of the prompt and the experts in those slots
-are copied back afterwards, so a short prompt lends only what it needs. A bare `auto` reads a prompt in the fewest equal chunks of at most 12288 tokens (16384 with `--peer-exclusive`), because
+are copied back afterwards, so a short prompt lends only what it needs. A bare `auto` reads a prompt in the fewest equal chunks of at most 16384 tokens, because
 a chunk's cost per token stops falling past a few thousand tokens; it is still limited to what the lend can fund, which with
-`--resident-experts` is the lent slots whose experts the RAM copy holds plus a fixed amount of file reading, and without
+`--resident-experts` is the lent slots whose experts the RAM copy holds plus a fixed amount of file reading (7 GiB), and without
 `--resident-experts` is 8192. `--prefill auto:N` (N = 8192, 16384 or 32768) sets the ceiling yourself; a number sets a
 fixed chunk. A prompt longer than one chunk is split into equal chunks (a short tail chunk costs nearly a whole pass over
 the streamed experts). The startup line `prompt chunk auto: N tokens` says what was
@@ -166,11 +184,14 @@ Basalt refuses settings that would leave the machine without memory, and never s
   floor free for the OS file cache: the RAM margin (2 GiB or 5% of the RAM, the larger) plus 3.5 GiB plus two layers'
   experts, which is what one prompt chunk reads from the file. The startup line `RAM floor ...` gives the figures.
   When every expert has a place, only the margin is kept, as before.
+- A server's RAM copy also leaves room for what serving takes after startup: the conversation checkpoints (each the
+  model's whole running state, `--prompt-cache` of them per slot plus one), `--conversation-cache-mib`, one image's
+  buffers and a request's own buffers. The startup line `RAM ... free, guard ...` gives the figures.
 - An explicit `--resident-budget-gib` that would leave less than that floor free is refused at startup; the error
-  states the RAM available and the largest safe value.
+  states the RAM free and the largest safe value ('max').
 - While serving, a request that finds MemAvailable below the margin plus 3.5 GiB (the margin alone when no expert is
-  read from the SSD) stops with an error (`basalt error: RAM ran low
-  while generating ...`, also returned to the client); the server keeps running and takes the next request.
+  read from the SSD) stops with an error (`RAM low (... free < ... guard): request stopped`, also returned to the
+  client); the server keeps running and takes the next request.
 
 ### Vision: `--vision`
 
@@ -231,21 +252,24 @@ python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPRO
 
 ## Models
 
+Ready-to-run `.basalt` packs are on [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt). A pack
+you convert yourself will be significantly slower than the official `.basalt` files.
+
 Quality measured with `basalt-bench --quality`: 20 chunks of wikitext-2 (512 tokens each), scored through the decode
 path against the Q8_0 reference. Lower KLD and higher top-1 agreement are closer to Q8_0. How precision is handled and how quality is measured:
 [docs/precision.md](docs/precision.md).
 
 | model | source | file | experts | PPL | KLD mean | same top-1 |
 |---|---|---:|---:|---:|---:|---:|
+| GSQ-RCO-Coder IQ1_M (256 experts) | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) | 57.4 GiB | 23.4 GiB | | 1.03 | 69% |
 | GSQ-RCO Q2_0 | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 64.9 GiB | 31.6 GiB | 2.971 | 0.486 | 80.6% |
 | GSQ-RCO IQ3_XXS | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 74.4 GiB | 40.0 GiB | 2.535 | 0.277 | 86.8% |
-| GSQ-RCO IQ3_S | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 81.0 GiB | 46.8 GiB | 2.387 | 0.177 | 89.4% |
-| GSQ-RCO-Coder IQ1_M (256 experts) | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) | 57.4 GiB | 23.4 GiB | | 1.03 | 69% |
 | UD-Q2_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 76.5 GiB | 42.9 GiB | 2.755 | 0.323 | 84.3% |
 | UD-IQ3_XXS | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 79.4 GiB | 45.3 GiB | 2.564 | 0.244 | 87.0% |
+| GSQ-RCO IQ3_S | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 81.0 GiB | 46.8 GiB | 2.387 | 0.177 | 89.4% |
 | UD-Q3_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 86.8 GiB | 52.0 GiB | 2.457 | 0.160 | 89.3% |
-| UD-Q4_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 106.7 GiB | 71.7 GiB | 2.321 | 0.068 | 93.0% |
 | NVFP4-GPTQ ([below](#nvfp4-pack)) | [Maximilian228](https://huggingface.co/Maximilian228/Qwen3.8-Flash-Next-NVFP4-GPTQ-Strata) experts, UD-Q4_K_XL rest | 98.3 GiB | 63.3 GiB | 2.292 | 0.088 | 92.5% |
+| UD-Q4_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 106.7 GiB | 71.7 GiB | 2.321 | 0.068 | 93.0% |
 | Q8_0 | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 178.3 GiB | 119.5 GiB | 2.282 | reference | |
 
 The IQ3_S, IQ3_XXS and Q2_0 packs carry an MTP layer fine-tuned on the model's own output (self-distillation), which
@@ -287,21 +311,6 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --
 
 Every section but the experts is copied and checked by SHA-256 against the source pack, and `meta.experts_swap`
 records both inputs. How NVFP4 is computed on each tier: [docs/precision.md](docs/precision.md).
-
-### Coder pack (expert-pruned)
-
-[GSQ-RCO-Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) keeps 256 of the 512 routed
-experts (IQ1_M, about 3.5 bits per weight; two GGUF shards, 29.6 GB transformer and 28.8 GB n-gram) and targets code,
-agentic tool use, vision and spatial reasoning. Their card reports SWE-bench Verified 75.6 (BF16: 82.8) and
-LiveCodeBench v6 86.3 (87.4). `tools/convert` reads the expert count from the tensors, and the canonical 512-expert
-tuned MTP drafter attaches to it. The table row is general text (wikitext-2), where the pack is clearly worse by
-design. On code (20 chunks of C++, CUDA and Python source, perplexity against the Q8_0 pack) it is close: Q8_0 3.08,
-IQ3_S 3.06, Coder 3.22 (+4.7%).
-
-Speed (RTX 5090 + RTX 5060 Ti, 400 W, `--peer-exclusive`, resident experts, int8 KV): all experts fit on the GPUs,
-and decode runs at 303 tok/s on conversation, 240 on prose and 419 on structured output, with 16k prefill at 7,356
-tok/s. The native fused router covers only 512 experts, so a pruned pack takes the generic router, about a third of
-each decode step. A native router for it is not planned; Q2_0 is the pack for small setups.
 
 The model files are derived from Qwen3.8-Flash-Next and are distributed under the
 [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE), not Basalt's MIT
