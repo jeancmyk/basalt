@@ -236,6 +236,18 @@ namespace detail {
 bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
                            const std::string& cgroup_root) {
     m = HostMemory{};
+#if defined(_WIN32)
+    // No /proc/meminfo and no cgroup hierarchy here: the OS reading is the whole answer, and there is no container
+    // limit tighter than it.
+    (void) meminfo;
+    (void) self_cgroup;
+    (void) cgroup_root;
+    const uint64_t avail = basalt::platform::available_memory();
+    if (avail == 0) return false;
+    m.available = avail;
+    m.cgroup_limit = ~0ull;
+    return true;
+#else
     // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
     std::ifstream info(meminfo);
     std::string line;
@@ -321,6 +333,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     }
     m.available = bytes;
     return true;
+#endif
 }
 
 }  // namespace detail
