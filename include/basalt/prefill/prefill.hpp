@@ -21,8 +21,10 @@
 #include <future>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace basalt::core { class PeerExperts; }
+namespace basalt::kernels::cpu { class ExpertPool; }
 
 namespace basalt::prefill {
 
@@ -34,6 +36,8 @@ struct PrefillStats {
     int64_t experts_streamed = 0;   ///< expert blobs copied host -> device
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
+    int64_t experts_cpu = 0;        ///< experts computed on the CPU pool instead of streamed
+    double cpu_share = 0;           ///< the share of the streamed experts the CPU took last
     double ms_ple = 0;
 };
 
@@ -102,6 +106,13 @@ public:
 
     const PrefillStats& stats() const { return stats_; }
 
+    /// Starts counting, per (layer, expert), the routed entries of the prompt rows this stage and the stages after it
+    /// read, from zero.  Call with the stream idle (between requests).
+    void route_hist_reset();
+    /// Adds the counts since `route_hist_reset` (n_layers x n_expert, each stage fills its own layers) into `out`
+    /// and the prompt tokens they cover into `tokens`, and stops counting.  False when counting was not started.
+    bool route_hist_take(std::vector<uint32_t>& out, int64_t& tokens);
+
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
@@ -109,6 +120,12 @@ public:
     /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path reads them from its memory
     /// over P2P (into the ring, or in place).  Independent of set_peer.
     void set_ring_peer(core::PeerExperts* peer);
+
+    /// The CPU expert pool (idle while a prompt is read). A chunk below stream_all_min() tokens hands it the
+    /// non-resident experts with a host copy that few of its tokens route to, instead of streaming them; their rows
+    /// go to the tail of Dm unweighted, like the peer's, and the combine weights them. The share is balanced from the
+    /// measured CPU and GPU cost per expert. Only for a pool no other thread runs meanwhile. Null: every expert on the GPU.
+    void set_cpu_pool(kernels::cpu::ExpertPool* pool);
 
     /// Called after every chunk with the chunk's final multi-stream residual rows (device,
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its
@@ -144,6 +161,7 @@ private:
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     bool drain_pipeline(std::string& err);
 
+    kernels::cpu::ExpertPool* cpu_pool_ = nullptr;
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)

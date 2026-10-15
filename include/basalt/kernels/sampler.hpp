@@ -25,6 +25,7 @@ struct SamplerParams {
     uint64_t seed = 0;           // drives Philox, which is counter-based on (seed, token index)
     uint64_t counter = 0;        // absolute draw index of row 0; advance across decode calls
     bool greedy = false;
+    const float* logit_bias = nullptr;   // optional device array [n_vocab] added to the logits first; -inf bans
 };
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.
@@ -41,6 +42,12 @@ struct SamplerParams {
 // A verify window's rows need DIFFERENT histories: row t follows the window's drafts 1..t (`penalty_rows`).
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream);
+
+// sample_tokens, and on the sampled path also qprob[t] (t < n_query) = the probability of token query[t] under row
+// t's final distribution (the chain's survivors after temperature; 0 outside them).  The picks are sample_tokens'
+// own.  On the greedy path qprob is not written.  `query` and `qprob` are device (or mapped) pointers.
+void sample_tokens_probe(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                         const SamplerParams& p, int* out, const int* query, int n_query, float* qprob, void* stream);
 
 // The greedy pick (no penalties) on a thread-block cluster of 8 CTAs per row (needs thread-block clusters): the same token as
 // sample_tokens' one-block argmax.  False (nothing launched) where it

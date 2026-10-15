@@ -8,13 +8,16 @@ tier, 32 GB of system RAM.
 
 ## Summary
 
-- **MTP does not change output.** With the expert tiers pinned, 275 of 275 greedy prompts produced identical tokens on
+- **MTP does not change output** (unless `--relaxed-drafting` is set: [see below](#relaxed-drafting)). With the expert tiers pinned, 275 of 275 greedy prompts produced identical tokens on
   both packs tested, and every full-vocabulary fp32 logit row (62,271 and 60,878) was bit-identical between `--spec 0`
   and `--spec 7`.
 - **KLD matches llama.cpp.** On the same GGUFs against the same base, Basalt and llama.cpp's own `llama-perplexity`
-  agree: IQ3_S 0.15264 vs 0.1526, IQ3_XXS 0.2433 vs 0.2428 at 100 chunks.
+  agree: IQ3_S 0.15264 vs 0.1526, IQ3_XXS 0.2433 vs 0.2428 at 100 chunks, with the exact head. The two-stage
+  verify head of a Q6_K head (IQ3_S) adds about 0.0017 ([see below](#two-stage-verify-head)).
 - **No requantization.** Weights are the GGUF blocks as shipped. The one exception is the hyper-connection matrices,
-  which decode reads from an int8 copy with one fp16 scale per 32 inputs.
+  which decode reads from an int8 copy with one fp16 scale per 32 inputs. A Q6_K output head is also screened through a
+  2-bit copy in verify: the rows near the top are the exact Q6_K logits, the far tail keeps the copy's approximate logits
+  ([details](#two-stage-verify-head)).
 - **fp32 where it matters.** Activations are fp32 in the residual stream, norms, router, softmax and logits, and int8
   (q8_1) into the quantized matmuls. GDN state is fp32. KV is fp16 by default, with int8, q4_0 and k8v4 options.
 - **Quality is scored through decode.** Prefill is a different computation (fp16/BF16 GEMMs); the quality gate scores
@@ -38,12 +41,12 @@ hyper-connection streams, 48 layers (36 GDN, 12 QSA), 512 experts, top-10, head_
 | GDN ssm_alpha, ssm_beta; QSA indexer q/k projections | BF16 | model_sections.py:52-53 |
 | Router | BF16, not quantized | model_sections.py:48 |
 | Norm weights, ssm_a, ssm_dt, conv1d, ssm_norm | F32 | model_sections.py:55-60 |
-| Hyper-connection (hc) matrices (down, up, inject; per layer and for the output head) | Stored BF16 in the pack; decode reads an int8 copy: int8 codes with one fp16 scale per 32 consecutive inputs, scale = f16(absmax/127), codes clamped to ±127 | hc_fused.cu:343, 1168-1186, 1210-1227; verify.cpp:561-572 |
+| Hyper-connection (hc) matrices (down, up, inject; per layer and for the output head) | Stored BF16 in the pack; decode reads an int8 copy: int8 codes with one fp16 scale per 32 consecutive inputs, scale = f16(absmax/127), codes clamped to ±127 | hc_fused.cu:343, 1173-1191, 1215-1232; verify.cpp:561-572 |
 | Token embedding | GGUF type kept in mapped host memory, one row dequantized to fp32 per token | native_head.hpp:42-45; verify.cpp:948-961 |
-| Output head | A native_mmvq type with dedicated Q5_K and Q6_K kernels; the IQ3 packs use a Q5_K head | verify.cpp:1877-1882 |
+| Output head | A native_mmvq type with dedicated Q5_K and Q6_K kernels; the IQ3_S pack's head is Q6_K. A Q6_K head runs in two stages in verify: every row is scored from a 2-bit copy (the draft head's fit below: four levels and an fp16 scale per 32 weights, the scale raised by sqrt(\|w\|²/⟨w, ŵ⟩)), on int8 tensor cores; the rows within 4 of a lower bound on the column's 64th-best approximate logit are rescored exactly (the bits of the plain Q6_K kernel), and every other row keeps its approximate logit. The argmax and the sampler's top-64 list come from exact rows; the tail of the softmax is approximate (see [Two-stage verify head](#two-stage-verify-head)). The copy (199 MB for 248,320 rows) is packed at load, before the expert cache is sized | native_head.cpp; verify.cpp (the head); q6k_head.cu (q6k_vhead) |
 | MTP drafter dense | Q8_0 for fc_embedding, fc_hidden, q/k/v/o, indexer projection and the shared-expert projections; BF16 for the rest; 1-D tensors F32 | model_sections.py:334-338, 444-470 |
 | MTP drafter experts | Q2_0, all in VRAM | model_sections.py:482-487 |
-| MTP draft head | Rows gathered from the main head (same type), optionally a vocabulary subset; the leading rows are first scored from a 2-bit copy and the near-best rows rescored exactly, so a draft differs from the exact argmax only in rare cases, and the draft probability is approximate | mtp.cpp, q5k_head.cu |
+| MTP draft head | Rows gathered from the main head (same type), optionally a vocabulary subset; for a Q5_K or Q6_K head the leading rows are first scored from a 2-bit copy (four levels and an fp16 scale per 32 weights) and the rows within 5 of the best approximate score (at most 64) rescored exactly, so a draft differs from the exact argmax only in rare cases, and the draft probability is approximate: the other rows' terms of its softmax sum come from the 2-bit scores. The copy's scale (Q5_K and Q6_K alike) is raised by sqrt(\|w\|²/⟨w, ŵ⟩) per group, since the least-squares copy scores the near-best rows low and inflates the probability (on the Q5_K parity test's synthetic head over 12 seeds the probability's mean relative error halves, from 0.028-0.043 to 0.010-0.020, and the worst trial from up to 1.04 to under 0.45); on 1500 real draft-head inputs of the IQ3_S pack the probability's mean error is +0.005 (+0.017 with the least-squares scale) and the pick matches the exact argmax in 99.93% | mtp.cpp, head_proxy.cuh, q5k_head.cu, q6k_head.cu |
 | MTP hc matrices | The same int8 copies | mtp.cpp:218-263 |
 
 The drafter only proposes tokens; verify decides every token, so the drafter's precision affects speed, not output.
@@ -52,16 +55,16 @@ The drafter only proposes tokens; verify decides every token, so the drafter's p
 
 | Matmul | Activation format | Source |
 |---|---|---|
-| hc down and inject (hc read) | fp32, no activation quantization; int8 weights converted exactly, fp32 fmaf per group | hc_fused.cu:343-370, 489 |
-| hc up | fp32 input split into an fp16 high and low part (about 22-bit mantissa), fp16 tensor-core mma with fp32 accumulate, per-group fp16 scale applied in fp32 | hc_fused.cu:632-695 |
-| Router | fp32 times BF16 weight, fp32 FMA | hc_fused.cu:737-780; native_bf16.cu:34-125 |
+| hc down and inject (hc read) | fp32, no activation quantization; int8 weights converted exactly, fp32 fmaf per group | hc_fused.cu:343-370, 492 |
+| hc up | fp32 input split into an fp16 high and low part (about 22-bit mantissa), fp16 tensor-core mma with fp32 accumulate, per-group fp16 scale applied in fp32 | hc_fused.cu:635-698 |
+| Router | fp32 times BF16 weight, fp32 FMA | hc_fused.cu:740-785; native_bf16.cu:34-125 |
 | GDN qkv, QSA q, GDN ssm_out, QSA o | q8_1: int8 codes with an fp16 scale per 32 values, int8 tensor-core dot (dense_tc) | native_mmvq.cu:147-162; dense_tc.hpp:2-12 |
 | GDN z, QSA k/v | z through dense_tc together with qkv when eligible; otherwise native_mmvq (dp4a on q8_1) | dense_tc.cu:1155; verify.cpp:1145-1170 |
 | Routed experts gate/up | q8_1 of the fp32 FFN input; dp4a with exact int32 per block | hc_fused.cu:63-77; iq_kernels.cu:202-228 |
 | Routed experts down | fp32 SwiGLU, then q8_1 per 32 | iq_kernels.cu:1909-1920 |
 | Shared expert | q8_1 into gate/up; fp32 SwiGLU, q8_1 into down; sigmoid gate fp32 | shared_expert.cu:178-215 |
 | GDN alpha/beta, indexer projections | fp32 activation times BF16 weight, fp32 FMA | dec_gdn_rec.cu:88-112; verify.cpp:1315-1327 |
-| Output head | q8_1 of the fp32 final stream, mmvq or the Q5_K/Q6_K kernels | verify.cpp:1876-1885 |
+| Output head | q8_1 of the fp32 final stream, mmvq or the Q5_K/Q6_K kernels; the two-stage Q6_K head's first stage takes the same q8_1 codes as int8 mma inputs (exact int32 per 32-group), fp32 scale terms | verify.cpp (the head); q6k_head.cu |
 | CPU expert tier (experts not resident on a GPU) | The fp32 input quantized with ggml's vec_dot_type (Q8_K per 256 for i-quant gate/up; Q8_0 or Q8_K for down), so it rounds differently from the GPU tiers | native_expert.cpp:52-62, 84-139 |
 
 Unlike llama.cpp, Basalt does not quantize the activations of the hc read to Q8_0.
@@ -73,7 +76,7 @@ Unlike llama.cpp, Basalt does not quantize the activations of the hc read to Q8_
 | int8 dot products | Exact int32 per 32-value block, then fp32 scale terms summed in fp32 | dense_tc.cu:60-68, 1007-1010 |
 | Residual stream and hc buffers | fp32 | verify.hpp:468-469; hc_fused.hpp:22-38 |
 | RMSNorm | fp32, eps 1e-6 | verify.cpp:116 |
-| fp16/BF16 accumulators | None; hc up uses fp16 mma inputs with fp32 accumulate | hc_fused.cu:632-695 |
+| fp16/BF16 accumulators | None; hc up uses fp16 mma inputs with fp32 accumulate | hc_fused.cu:635-698 |
 | KV cache (`--kv`) | fp16, int8, q4_0 (alias q4), k8v4 (int8 K, rotated Q4_0 V). Engine default fp16; the sample config in the README uses int8 | generate.cpp:327, 1736-1743; README.md (Settings) |
 | int8 KV layout | int8 codes with an fp16 scale per 64 values (4 per 256-wide head, separate for K and V), scale = f16(amax/127) | kv_q8.hpp:3-5, 26-28; kv_q8.cu:46-52 |
 | Attention | K/V dequantized to fp32; scores in fp32; online softmax per 64-cell chunk in fp32 (`__expf`), fp32 merge; output gate sigmoid, then q8_1 for the o-projection | qsa_dec_attn.cu:114-138, 255-420 |
@@ -85,6 +88,7 @@ Unlike llama.cpp, Basalt does not quantize the activations of the hc read to Q8_
 | Expert combine | fp32, in router rank order, plus shared expert | native_moe.cu:35-50 |
 | Final logits | fp32 `[T][n_vocab]` | verify.hpp:489 |
 | Greedy sampling | fp32 argmax, lowest index wins ties | sampler.cu:79-90 |
+| Request `logit_bias` | Only when a request sends one: fp32 bias added to the fp32 logits before the penalties and filters; -100 is -inf (the token cannot be picked), other values are added as given. Without one the sampler reads the same logits and takes the same code path as before | sampler.cu; logit_bias.hpp |
 | KLD scoring (host) | Log-sum-exp and KLD accumulated in double from the fp32 logits | ppl_gate.hpp:125-154 |
 
 ### Prefill
@@ -97,10 +101,84 @@ Prefill and decode are different computations that read and write the same KV an
 | hc matrices | Activations rounded to BF16; down/up use the int8 copy dequantized to BF16; inject uses the BF16 tensor | prefill.cpp:1500-1506; gemm.cu:136-159 |
 | Router | BF16 activation (decode: fp32) | prefill.cpp:1631 |
 | Shared expert | fp16 activation, fp16 SwiGLU | prefill.cpp:1634-1637 |
-| Routed experts | Fused int8 mma kernels, llama.cpp MMQ (q8_1) or dequant-to-fp16 cuBLAS | moe_fused_iq.hpp:1-12; moe_mmq.hpp:1-6 |
+| Routed experts | Fused int8 mma kernels, llama.cpp MMQ (q8_1) or dequant-to-fp16 cuBLAS (IQ1_M only). The K-quants (Q4_K, Q5_K, Q5_1: UD-Q4_K_XL) run on MMQ with fp16 activation scales and per-32 partial sums taken from the rounded int8 values (llama.cpp sums the floats), so the product is exactly the dequantized weights times the rounded activations | moe_fused_iq.hpp:1-12; moe_mmq.hpp:1-6; mmq/quantize.cu:59-69 |
+| Routed experts on the CPU (chunks below 1,024 tokens) | Non-resident experts with a host copy and at most 8 rows run on the CPU pool with ggml's dot products, as decode's RAM tier does: the activation in the weight type's `vec_dot` format (Q8_K per 256 values for the IQ types, not q8_1 per 32), H quantized to the down type's format. Their rows are written unweighted and the combine weights them like the GPU's. Which experts go is set per layer from the measured CPU and GPU cost per expert, so it can differ from run to run | prefill.cpp:1862-1900,1928-1985,2339-2352 |
 | Attention | fp16 mma with hi/lo split of q and p, fp32 accumulate | qsa_prompt_attn.hpp:1-22 |
 | Indexer scores | 3xTF32 tensor cores | qsa_select.hpp:36-38 |
 | GDN | State fp32; out-projection input fp16 | kernels.cu:609-623 |
+
+**CPU share of the experts.** `tests/cuda/prefill_cpu_share_test.cpp` runs the pool and the MMQ path on random native
+blobs at the model's geometry, up to 8 rows per expert, against a double-precision reference. Relative RMS error of the
+expert outputs, MMQ / CPU: 1.0e-2 / 1.2e-2 with plain activations (all four format pairs), 1.4e-2 to 1.6e-2 / 3.1e-2 to
+3.4e-2 when 0.5% of the activations are 12 times larger (the CPU's Q8_K block is 256 values wide, MMQ's 32). A row's output
+does not depend on how many tokens share its expert's job (bitwise, every pair). Quality gate, IQ3_S, 100 chunks, 400 W,
+the 256-token prompt half through this path: PPL 3.3727, KLD 0.15267, top-1 87.22% against 3.3769, 0.15351, 87.19%
+for the build without it. Prefill with the share is not reproducible bit for bit between runs, because the share follows
+the measured costs. The identity checks below compare logits across engine sessions, so for a prompt whose chunks are
+below 1,024 tokens the two sessions' KV, and with it their rows, can differ at this level, and those checks are no longer
+bit-identical across sessions.
+
+**K-quant experts on MMQ.** `tests/cuda/prefill_mmq_kq_test.cpp` runs MMQ and the FP16 dequant + cuBLAS path it
+replaced on random zero-centred experts at the model's geometry against a double-precision reference. Relative RMS
+error of the expert outputs, MMQ / FP16 path: 1.08e-2 / 5e-4 with plain activations (Q4_K/Q5_1, Q4_K/Q8_0, Q5_K/Q8_0),
+1.48e-2 to 1.51e-2 / 5e-4 with 0.5% of the activations 12 times larger; with llama.cpp's float partial sums MMQ read
+1.21e-2 to 1.76e-2 and 1.77e-2 to 2.19e-2. A row re-run alone or in another batch differs from its row in the full batch
+by at most 7e-4 of the row's largest output: MMQ's stream-k split and tile width follow the launch's size, and H's int8
+rounding can turn a reordered sum into one int8 step. The i-quant MMQ path does the same (6.5e-4, IQ4_XS/IQ4_NL). Quality
+gate, UD-Q4_K_XL, 100 chunks, 400 W, the 256-token prompt half through this path: PPL 3.3297, KLD 0.05653, top-1 92.06%
+against 3.3223, 0.05695, 92.22% with the FP16 path.
+
+## Two-stage verify head
+
+A Q6_K output head (the IQ3_S pack's) runs in two stages in the verify window (`q6k_vhead`, q6k_head.cu). Every one of the
+248,320 rows is scored from a 2-bit copy (the draft head's fit, head_proxy.cuh) on int8 tensor cores against the same
+q8_1 codes the exact kernel reads. Each block of rows adds its per-column maximum to a histogram; the lower edge of the bin
+holding the 64th largest block maximum is at or below the column's 64th largest approximate logit, and every row within 4
+of it is rescored exactly with the plain Q6_K kernel's arithmetic (the same bits). The other rows keep their approximate
+logits, so log-probabilities stay finite. The block partition does not depend on the window width, so a token's logits
+are the same bits at every T.
+
+What it changes: the argmax and the sampler's top-64 list come from exact rows unless the copy's error exceeds the margin;
+the softmax tail outside the rescored rows carries the copy's error (rms about 0.7 logit).
+
+Offline, on 3,614 real verify-head inputs dumped from the engine (conv, struct, prose fixtures), all 248,320 rows, exact =
+Q6_K x q8_1 in float:
+
+| Fixture | Inputs | Top-64 recall, margin 4 | Margin 6 | Margin 8 | Rows rescored per column, margin 4 (mean / p99) | Greedy pick unchanged | KLD exact -> two-stage (mean) |
+|---|---|---|---|---|---|---|---|
+| conv | 1,232 | 99.971% | 100% | 100% | 1,333 / 6,286 | 100% | 4.7e-4 |
+| prose | 1,124 | 99.979% | 100% | 100% | 1,098 / 2,988 | 100% | 5.1e-4 |
+| struct | 1,258 | 99.968% | 100% | 100% | 1,981 / 12,790 | 100% | 2.5e-5 |
+
+Margins 6 and 8 rescore 5,569-18,649 and 27,962-78,806 rows per column. Neither a least-squares scale for the copy nor a
+per-column correction of the tail's bias lowers the KLD (the tail's mass is unbiased; the cost is its noise).
+
+Quality gate (IQ3_S, 100 chunks, against the Q8_0 base, tiers pinned to `--expert-cache 9000 --peer-slots 7562`, 400 W;
+the gate leaves the PCIe share dynamic, so two runs of one build differ):
+
+| Head | Run | PPL | KLD mean | KLD median | KLD p99 | Same top-1 |
+|---|---|---|---|---|---|---|
+| exact Q6_K | 1 | 3.3778 | 0.15355 | 0.03400 | 1.7316 | 87.36% |
+| exact Q6_K | 2 | 3.3728 | 0.15288 | 0.03397 | 1.7082 | 87.18% |
+| two-stage | 1 | 3.3852 | 0.15507 | 0.03484 | 1.7681 | 87.24% |
+| two-stage | 2 | 3.3827 | 0.15472 | 0.03497 | 1.7381 | 87.40% |
+
+The two-stage head raises KLD by about 0.0017 (1.1%) and PPL by 0.2%, more than the 0.0007 between two runs of one build:
+the gate scores the whole softmax, including the approximate tail. Same top-1 is unchanged. Greedy decoding with the tiers
+pinned (`tools/greedy_identity.py`, the three bench prompts, 900 tokens) is token-identical to the exact head.
+
+## Request logit bias
+
+`logit_bias` (Chat Completions) is applied by the verifier's own sampling, on every row of every window, so a bias is
+part of the distribution speculation must reproduce: the host-side sampling that already follows each window (the same
+one a temperature or a penalty uses) runs with the bias, and a draft is accepted only if it equals that pick. The draft
+head ignores the bias; it only proposes tokens, so a banned token it proposes is rejected, and a biased request
+accepts fewer drafts. A request without a bias takes the unchanged captured greedy sample.
+
+Checked on IQ3_S with the tiers pinned as in the section below: requests with a bias (greedy and seeded, a ban, a
+boost, a mixed map, with and without a presence penalty) return the same text with `--spec 7 --spec-min-p 0.5` as with
+`--spec 0`, and a request with an empty map matches one without the field. A -100 bias never yields the token and
+a +100 bias yields it at every step.
 
 ## Speculative decoding does not change output
 
@@ -154,7 +232,97 @@ against the base.
   same for spec 0 and spec 7.
 - Prompts are 19 to 395 tokens with 256 new tokens: this tests the decode path, not long context.
 
-## Quality against Q8_0
+## Relaxed drafting
+
+`--relaxed-drafting P` (opt-in; off by default) gives up the guarantee above for sampled requests. In exact mode a draft
+is kept only when it equals the target's own draw at that row (`src/program/generate.cpp`, the acceptance loop after
+`ver.run`). In relaxed mode a draft is also kept when the target gives it probability P or more under the request's
+final distribution (top_k, top_p, min_p, temperature and penalties applied). The sampler reports that probability next to
+its draw (`sample_tokens_probe`, src/kernels/cuda/sampler.cu); the logits and the draws themselves do not change.
+
+**What changes.** The drafts are the draft head's argmax, fixed by the context. At a row where the draft d has
+p(d) ≥ P, the output is d every time instead of a draw from p: that row is greedy. Its total-variation distance from the
+model's distribution is exactly 1 − p(d), and 0 at every other row. Rows after a kept draft are conditioned on it,
+as plain decoding would be. What stays exact: greedy requests (nothing is drawn), requests with `logit_bias`, JSON
+`response_format` (the server sends `relax=0`), the quality gate, `--parallel` batch slots, any drafted added token
+(ids from `<|endoftext|>` on: control tokens, think and tool tags, end of turn), and every token from `<tool_call>` to
+`</tool_call>`, so a tool name and its arguments are sampled exactly.
+
+**Exact mode is unchanged.** With the flag off and the tiers pinned, IQ3_XXS, the three bench prompts greedy plus conv
+and prose at temperature 0.6 and 1.0 with two seeds each (600 tokens): all 11 token streams are identical to the build
+before the flag. With the flag on, the three greedy streams are identical too.
+
+**Distribution cost per token (offline replay).** Real verify windows were logged (per row: the draft, the target's
+draw, the target's final probabilities) for the bench prose and conv prompts (three seeds) and five natural chat
+prompts, at temperature 0.6 and 1.0 (top_p 0.95, top_k 20), on IQ3_S and IQ3_XXS, about 3,500 tokens per cell. The
+replay keeps a draft when the rule would, and averages 1 − p(d) over the relaxed rows per generated token
+(TV/token; 0 for exact). Token gain is the replayed extra tokens per window at the logged window widths; the live
+gain below is larger because the window controller lengthens windows when more drafts are kept.
+
+| Model | Prompts | T | Exact accept | P = 0.5 gain / TV | P = 0.3 gain / TV | P = 0.2 gain / TV |
+|---|---|---|---|---|---|---|
+| IQ3_XXS | prose | 0.6 | 64.1% | +4.3% / 0.026 | +6.9% / 0.042 | +9.2% / 0.052 |
+| IQ3_XXS | natural | 0.6 | 64.5% | +5.3% / 0.030 | +8.4% / 0.050 | +10.7% / 0.063 |
+| IQ3_XXS | prose | 1.0 | 61.6% | +5.6% / 0.035 | +11.1% / 0.064 | +13.9% / 0.080 |
+| IQ3_XXS | natural | 1.0 | 62.9% | +6.6% / 0.043 | +12.1% / 0.073 | +15.2% / 0.089 |
+| IQ3_S | prose | 0.6 | 63.7% | +3.0% / 0.022 | +5.9% / 0.037 | +7.2% / 0.046 |
+| IQ3_S | natural | 0.6 | 64.5% | +4.9% / 0.030 | +8.0% / 0.049 | +9.8% / 0.060 |
+| IQ3_S | prose | 1.0 | 61.1% | +5.1% / 0.035 | +9.3% / 0.061 | +12.4% / 0.079 |
+| IQ3_S | natural | 1.0 | 62.3% | +7.1% / 0.042 | +11.9% / 0.072 | +14.7% / 0.089 |
+
+Every relaxed keep moves 1 − p(d) of probability mass, so tokens gained per unit of TV is nearly the same at every
+threshold: about +1.5% per 0.01 TV/token. Medusa-style typical acceptance (a threshold that falls with the entropy of p)
+was replayed too and lands on the same line; it is not a better trade, so the flag is the plain probability threshold.
+
+**Speed (400 W).** `basalt-bench` (conv and prose at temperature 0.6, struct greedy), the usual serving flags (`--spec 7
+--spec-min-p 0.5 --kv int8 --vram-reserve-mib 500 --resident-experts --peer-exclusive`), each value in three rounds
+interleaved with the others, the cold repetition dropped:
+
+| Model | Fixture | Exact | P = 0.5 | P = 0.3 | P = 0.2 |
+|---|---|---|---|---|---|
+| IQ3_XXS | prose | 348.7 | 366.8 (+5.2%) | 373.8 (+7.2%) | 382.4 (+9.7%) |
+| IQ3_XXS | conv | 383.8 | 421.5 (+9.8%) | 431.4 (+12.4%) | 423.3 (+10.3%) |
+| IQ3_XXS | struct (greedy) | 660.2 | 658.5 | 659.4 | 658.0 |
+| IQ3_S | prose | 323.8 | – | 347.2 (+7.2%) | – |
+| IQ3_S | conv | 354.2 | – | 392.9 (+10.9%) | – |
+
+In one engine session per model, the prose prompt and the five natural prompts, two seeds, the four settings
+interleaved per prompt (decode tok/s, 400 W):
+
+| Model | T | Exact | P = 0.5 | P = 0.3 | P = 0.2 |
+|---|---|---|---|---|---|
+| IQ3_XXS | 1.0 | 332.5 | 366.9 (+10.3%) | 385.5 (+15.9%) | 399.1 (+20.0%) |
+| IQ3_XXS | 0.6 | 351.2 | 370.1 (+5.4%) | 383.1 (+9.1%) | 380.9 (+8.5%) |
+| IQ3_S | 1.0 | 336.3 | 356.8 (+6.1%) | 369.7 (+9.9%) | 392.3 (+16.7%) |
+| IQ3_S | 0.6 | 347.0 | 359.2 (+3.5%) | 370.9 (+6.9%) | 382.4 (+10.2%) |
+
+**Quality.** The teacher-forced KLD gate cannot see this change: it scores logits, and relaxed drafting changes which
+token is emitted, not the logits. So the evidence is the replayed TV above plus sampled tasks. IQ3_S through the server
+(usual serving flags), temperature 1.0, top_p 0.95, top_k 20, thinking off, one seed per item so the settings are
+paired, the four settings in one server session (`relaxed_drafting` per request), 400 W:
+
+| Task | Exact | P = 0.5 | P = 0.3 | P = 0.2 |
+|---|---|---|---|---|
+| gsm8k, 300 items (flexible extract) | 0.947 ± 0.025 | 0.973 (+0.027 ± 0.020) | 0.980 (+0.033 ± 0.022) | 0.977 (+0.030 ± 0.023) |
+| MMLU-Pro, 20 per subject (280) | 0.682 ± 0.055 | 0.714 (+0.032 ± 0.040) | 0.725 (+0.043 ± 0.045) | 0.721 (+0.039 ± 0.046) |
+| Drafts kept by the rule, per generated token | 0 | 3.0% | 5.0% | 5.6% (with the tool requests) |
+
+The ± are 95% intervals (paired difference against exact in brackets). An earlier session in which every arm ran exact
+(the per-request key had not reached the engine) scored gsm8k 0.960 to 0.970 and MMLU-Pro 0.696 to 0.714 across four
+exact runs, with 6 to 9 and 24 to 35 items flipping between runs (the adaptive expert tiers round differently run to
+run): this session's exact arm is at the low end of that spread. No loss is measurable at this size; the relaxed arms
+sit at or above the exact runs, as expected of a change that makes confident rows greedy (a lower effective
+temperature). The cost is diversity, which these tasks do not measure; TV/token above is the direct measure.
+
+Tool calls, IQ3_S, the same sampling, 50 requests over 8 tools (similar names such as `replace_in_file` and
+`read_file`), thinking on for half: exact 53 calls and P = 0.2 52 calls, every name a declared tool, no leaked call
+text, all arguments valid JSON. The engine log shows the rule kept almost no drafts in these requests (the calls
+themselves are exact).
+
+**Choosing P.** `--relaxed-drafting` alone means 0.5: the smallest cost (TV/token 0.03 to 0.04), roughly +5% at
+temperature 0.6 and +6 to 10% at 1.0. 0.3 doubles both the gain and the cost; 0.2 is the aggressive end. Values above
+0.5 keep few drafts (0.7: about +2.5% at TV 0.015).
+
 
 `basalt-bench --quality` (`tools/ppl_gate.py`) scores wikitext-2 (`wiki.test.raw`) in 512-token chunks. The first half
 of each chunk is prefilled and the second half (rows 256 to 510) is scored through the decode path, against a llama.cpp

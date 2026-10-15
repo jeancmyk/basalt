@@ -102,6 +102,10 @@ if(BUILD_TESTING)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
   target_link_libraries(gguf_split_test PRIVATE artifact)
   add_test(NAME gguf_split_test COMMAND gguf_split_test)
+  # the logit_bias protocol key: what parses and what is refused (host only)
+  add_executable(logit_bias_test tests/core/logit_bias_test.cpp)
+  target_include_directories(logit_bias_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME logit_bias_test COMMAND logit_bias_test)
 endif()
 
 # ---- plan ----------------------------------------------------------
@@ -234,7 +238,7 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 # about arithmetic, and this one knows the ORDER the arithmetic happens in.
 add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
   src/core/remote_expert_opt.cu
-  src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
+  src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
   src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
@@ -252,6 +256,10 @@ if(BUILD_TESTING)
   set_tests_properties(expert_profile_save_test PROPERTIES TIMEOUT 60)
 endif()
 if(BUILD_TESTING)
+  # the shape check over a synthetic weight table: the canonical shapes pass, one wrong dimension or form fails
+  add_executable(layout_check_test tests/core/layout_check_test.cpp)
+  target_link_libraries(layout_check_test PRIVATE core)
+  add_test(NAME layout_check_test COMMAND layout_check_test)
   # the expert layout text: real models' layouts and the refusals
   add_executable(expert_layout_test tests/core/expert_layout_test.cpp)
   target_link_libraries(expert_layout_test PRIVATE engine)
@@ -304,6 +312,10 @@ if(BUILD_TESTING)
   target_link_libraries(expert_cache_segmented_test PRIVATE engine)
   add_test(NAME expert_cache_segmented_test COMMAND expert_cache_segmented_test)
   set_tests_properties(expert_cache_segmented_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  add_executable(kv_arena_test tests/core/kv_arena_test.cpp)
+  target_link_libraries(kv_arena_test PRIVATE engine)
+  add_test(NAME kv_arena_test COMMAND kv_arena_test)
+  set_tests_properties(kv_arena_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 endif()
 
 # `basalt` (generate.cpp): the engine program that composes the components into a token.  The prompt arrives as
@@ -448,6 +460,9 @@ add_executable(native_grouped_parity src/kernels/native_grouped_parity.cpp)
 target_include_directories(native_grouped_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(native_grouped_parity PRIVATE kernels ${_gpu_runtime_target})
 add_test(NAME native_grouped_parity COMMAND native_grouped_parity)
+# dec_moe_glue (plan built inside, gate/up pair kernel, SwiGLU, down) bitwise vs native_expert_grouped, every covered pair
+add_test(NAME native_grouped_parity_glue COMMAND native_grouped_parity --glue)
+set_tests_properties(native_grouped_parity_glue PROPERTIES TIMEOUT 300)
 add_executable(shared_expert_parity src/kernels/shared_expert_parity.cpp)
 target_include_directories(shared_expert_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(shared_expert_parity PRIVATE kernels ${_gpu_runtime_target})
@@ -596,6 +611,10 @@ add_executable(q6k_head_parity src/kernels/q6k_head_parity.cpp)
 target_include_directories(q6k_head_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(q6k_head_parity PRIVATE kernels ${_gpu_runtime_target})
 add_test(NAME q6k_head_parity COMMAND q6k_head_parity 20000 5)
+add_executable(q6k_vhead_parity src/kernels/q6k_vhead_parity.cpp)
+target_include_directories(q6k_vhead_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(q6k_vhead_parity PRIVATE kernels ${_gpu_runtime_target})
+add_test(NAME q6k_vhead_parity COMMAND q6k_vhead_parity 20000 5)
 
 # KV streaming: streamed vs resident attention, bitwise (GPU, synthetic, no model).
 add_executable(kv_stream_parity src/kernels/kv_stream_parity.cpp)
@@ -749,7 +768,7 @@ if(BUILD_TESTING)
 endif()
 # MMQ (ggml-cuda) for the prompt path's experts: the kernel, one instance per format the packs use, and the
 # activation quantizer; mmq_host.cu holds its few host symbols
-set(_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+set(_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q5_1 q4_k q5_k)
 # the Q2_0 pack's prompt experts on the engine's own int8 kernels (moe_fused.cu)
 add_library(mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
             src/prefill/mmq/mmq_host.cu src/prefill/mmq/quantize.cu)
@@ -776,6 +795,21 @@ if(BUILD_TESTING)
   target_link_libraries(prefill_fused_iq_test PRIVATE mmq ${_gpu_runtime_target})
   add_test(NAME prefill_fused_iq_test COMMAND prefill_fused_iq_test)
   set_tests_properties(prefill_fused_iq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+  # a small chunk's experts on the CPU pool against MMQ and a double-precision reference
+  add_executable(prefill_cpu_share_test tests/cuda/prefill_cpu_share_test.cpp)
+  target_link_libraries(prefill_cpu_share_test PRIVATE mmq kernels_cpu ${_gpu_runtime_target})
+  add_test(NAME prefill_cpu_share_test COMMAND prefill_cpu_share_test)
+  set_tests_properties(prefill_cpu_share_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+  # the prompt path's routed-entry histogram against a host count
+  add_executable(prefill_route_count_test tests/cuda/prefill_route_count_test.cpp)
+  target_link_libraries(prefill_route_count_test PRIVATE prefill ${_gpu_runtime_target})
+  add_test(NAME prefill_route_count_test COMMAND prefill_route_count_test)
+  set_tests_properties(prefill_route_count_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  # MMQ for the K-quant experts against the FP16 dequant + cuBLAS path and a double-precision reference (--bench: timings)
+  add_executable(prefill_mmq_kq_test tests/cuda/prefill_mmq_kq_test.cpp)
+  target_link_libraries(prefill_mmq_kq_test PRIVATE prefill mmq kernels ${_gpu_runtime_target})
+  add_test(NAME prefill_mmq_kq_test COMMAND prefill_mmq_kq_test)
+  set_tests_properties(prefill_mmq_kq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()
 add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
 target_include_directories(native_expert_parity PRIVATE ${_gpu_include_directories})
@@ -796,6 +830,8 @@ if(BUILD_TESTING)
     set_tests_properties(native_expert_parity_${_name} PROPERTIES TIMEOUT 120)
   endforeach()
   add_test(NAME native_expert_parity_q5_1_min COMMAND native_expert_parity --q5_1-min)
+  # the AVX-512 Q8_K activation quantizer bit for bit against ggml's reference
+  add_test(NAME native_expert_parity_q8k_quant COMMAND native_expert_parity --q8k-quant)
   # the BF16 token embedding gathered and dequantized bit for bit
   add_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
   # the Q6_K token embedding dequantized against ggml's reference

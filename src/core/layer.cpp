@@ -2,6 +2,7 @@
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "basalt/core/layer.hpp"
 #include "basalt/core/native_head.hpp"
+#include "basalt/core/kv_arena.hpp"
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/elementwise.hpp"
@@ -183,7 +184,7 @@ void gdn_buffers_zero_state(const GdnBuffers& b, const ModelGeometry& g, void* s
 static void st_begin(int64_t layer, int slot, void* stream);
 static void st_end(int64_t layer, int slot, void* stream);
 bool gdn_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const GdnBuffers& b,               const float* mixed, float* out, void* stream, std::string& err) {    const LayerView v(tables, layer);    const int64_t C = g.ssm_conv_channels;
-// ---- resolve.  Every one of these was shape-checked by `check_layer` at load time, so a miss here is a
+// ---- resolve.  Every one of these was shape-checked by `check_all` at engine start, so a miss here is a
 //      NAME problem and not a geometry one, and the message says which name.
 const WeightRef* w_qkv = v.get("attn_qkv.weight");    const WeightRef* w_gate = v.get("attn_gate.weight");    const WeightRef* w_out = v.get("ssm_out.weight");    const WeightRef* w_alpha = v.get("ssm_alpha.weight");    const WeightRef* w_beta = v.get("ssm_beta.weight");    const WeightRef* w_conv = v.get("ssm_conv1d.weight");    const WeightRef* w_norm = v.get("ssm_norm.weight");    const WeightRef* w_dt = v.get("ssm_dt.bias");    const WeightRef* w_a = v.get("ssm_a");    const char* missing = !w_qkv ? "attn_qkv.weight" : !w_gate ? "attn_gate.weight"                          : !w_out ? "ssm_out.weight" : !w_alpha ? "ssm_alpha.weight"                          : !w_beta ? "ssm_beta.weight" : !w_conv ? "ssm_conv1d.weight"                          : !w_norm ? "ssm_norm.weight" : !w_dt ? "ssm_dt.bias"                          : !w_a ? "ssm_a" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }
 // The conv kernel and the two norms are F32 source types, and the loader copied them verbatim - so their
@@ -465,6 +466,8 @@ namespace {
 // KV streaming: 0 keeps every cell in VRAM.
 int64_t g_kv_resident = 0;
 uint64_t g_kv_host_bytes = 0;
+// the elastic KV's floor (0: off)
+int64_t g_kv_elastic = 0;
 
 /// How one state holds its K/V: `mode` as in QsaState::kv_mode, `slots` VRAM pages of `pages` logical ones.
 struct KvPlan {
@@ -485,6 +488,12 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
         if (r < p.pages) { p.mode = 1; p.slots = r; }
     }
     return p;
+}
+// A state is elastic when the process asks for it and its K/V is whole in VRAM: the K/V pools, the indexer's pooled
+// keys and the rope tables then live in the state's arena, backed by prefix.  The pooled keys are one row per
+// idx_block cells, so they page with the K/V only when a page holds a whole number of rows.
+bool kv_elastic_state(const QsaShapes& s, const KvPlan& p) {
+    return g_kv_elastic > 0 && p.mode == 0 && s.idx_block > 0 && s.page_size % s.idx_block == 0;
 }
 uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8) {
     if (hybrid) {   // K8V4: the INT8 K half (codes + scales) plus the Q4_0 V half (kv_q4.hpp's rotation)
@@ -507,15 +516,17 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     uint64_t n = 0;
-    n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
-                       g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
+    const bool elastic = kv_elastic_state(s, p);   // elastic: pools, pooled keys and rope live in their own ranges
+    if (!elastic)
+        n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
+                           g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
     if (p.mode == 1) n += basalt::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
     n += (uint64_t) s.idx_dim * 4;                                             // dead
-    n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
+    if (!elastic) n += (uint64_t) p.pooled_rows * s.idx_dim * 4;               // pooled
     n += 16;                                                                   // block_pos
-    if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
+    if (with_rope && !elastic) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;   // cos + sin tables
     n += basalt::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
     n += (uint64_t) s.n_head * 4;                                              // pos_dev
     return align_up16(n) + 256;
@@ -545,7 +556,69 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.n_slots = p.slots;
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
     const uint64_t q4_row = basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim);
-    if (st.kv_hybrid) {
+    st.kv_arena = nullptr;
+    std::vector<uint8_t> rope_cos_host, rope_sin_host;   // the rope table, kept to fill the arena as it grows
+    if (kv_elastic_state(s, p)) {
+        // the same arrays, each in its own reserved range: per page, the row bytes of each array
+        const uint64_t pr = (uint64_t) s.n_head_kv * s.page_size;
+        const uint64_t code = pr * s.head_dim, scale = pr * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2;
+        std::vector<uint64_t> page_bytes;
+        if (st.kv_hybrid) page_bytes = {code, scale, pr * q4_row};
+        else if (st.kv_q4) page_bytes = {pr * q4_row, pr * q4_row};
+        else if (st.kv_int8) page_bytes = {code, code, scale, scale};
+        else page_bytes = {code * 2, code * 2};
+        const size_t n_kv = page_bytes.size();
+        // then the indexer's pooled keys (one row per idx_block cells, two spare rows past the last block) and, for
+        // the state that owns the rope table, its cos and sin rows
+        const uint64_t row = (uint64_t) s.idx_dim * 4, rope_row = (uint64_t) (s.n_rot / 2) * 4;
+        page_bytes.push_back((uint64_t) (s.page_size / s.idx_block) * row);
+        std::vector<uint64_t> tails(page_bytes.size(), 0);
+        tails.back() = 2 * row;
+        if (share_rope == nullptr) {
+            page_bytes.push_back((uint64_t) s.page_size * rope_row);
+            page_bytes.push_back((uint64_t) s.page_size * rope_row);
+            tails.resize(page_bytes.size(), 0);
+        }
+        // the table is built on the host (as below) and kept by the arena, which fills each page it maps from it
+        if (share_rope == nullptr) {
+            rope_cos_host.resize((size_t) max_cells * rope_row);
+            rope_sin_host.resize((size_t) max_cells * rope_row);
+            basalt::kernels::build_rope_table((int) s.n_rot, basalt::kernels::rope_scaling(), (int) max_cells,
+                                              (float*) rope_cos_host.data(), (float*) rope_sin_host.data());
+        }
+        KvArena* a = new KvArena();
+        std::string err;
+        if (!a->open(page_bytes, pages, s.page_size, err, tails)) {
+            std::fprintf(stderr, "basalt: elastic KV: %s\n", err.c_str());
+            delete a;
+            return 0;
+        }
+        if (share_rope == nullptr) {
+            a->set_contents(n_kv + 1, std::move(rope_cos_host));
+            a->set_contents(n_kv + 2, std::move(rope_sin_host));
+        }
+        if (!a->map(std::min(g_kv_elastic, max_cells), err)) {
+            std::fprintf(stderr, "basalt: elastic KV: %s\n", err.c_str());
+            delete a;
+            return 0;
+        }
+        st.kv_arena = a;
+        st.idx_pooled = (float*) a->array(n_kv);
+        if (share_rope == nullptr) {
+            st.cos_tab = (float*) a->array(n_kv + 1);
+            st.sin_tab = (float*) a->array(n_kv + 2);
+        }
+        if (st.kv_hybrid) {
+            st.k_q = (int8_t*) a->array(0); st.k_scale = (uint16_t*) a->array(1); st.v_q4 = a->array(2);
+        } else if (st.kv_q4) {
+            st.k_q4 = a->array(0); st.v_q4 = a->array(1);
+        } else if (st.kv_int8) {
+            st.k_q = (int8_t*) a->array(0); st.v_q = (int8_t*) a->array(1);
+            st.k_scale = (uint16_t*) a->array(2); st.v_scale = (uint16_t*) a->array(3);
+        } else {
+            st.k_pool = (uint16_t*) a->array(0); st.v_pool = (uint16_t*) a->array(1);
+        }
+    } else if (st.kv_hybrid) {
         st.k_q = c.take<int8_t>(rows * s.head_dim);
         st.k_scale = c.take<uint16_t>(rows * (s.head_dim / basalt::kernels::KV_Q8_GROUP));
         st.v_q4 = c.take<uint8_t>(rows * q4_row);
@@ -579,12 +652,12 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
     st.idx_dead = c.take<float>((uint64_t) s.idx_dim);
     st.idx_pooled_rows = p.pooled_rows;
-    st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+    if (st.kv_arena == nullptr) st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
     st.idx_block_pos = c.take<int32_t>(1);
     if (share_rope != nullptr) {
         st.cos_tab = share_rope->cos_tab;
         st.sin_tab = share_rope->sin_tab;
-    } else {
+    } else if (st.kv_arena == nullptr) {
         st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
         st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
     }
@@ -635,11 +708,13 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     // agree with the host's libm.  A table shorter than the sequence would have the rotation read past it.
     // The process's rope scaling (none by default) is INSIDE the table - the rotation kernels cannot tell.
     if (share_rope == nullptr) {
-        std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
-        basalt::kernels::build_rope_table((int) s.n_rot, basalt::kernels::rope_scaling(), (int) max_cells,
-                                          hc.data(), hs.data());
-        cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
-        cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+        if (st.kv_arena == nullptr) {   // an elastic state's arena is filled from the table as it maps
+            std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
+            basalt::kernels::build_rope_table((int) s.n_rot, basalt::kernels::rope_scaling(), (int) max_cells,
+                                              hc.data(), hs.data());
+            cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+        }
         st.owns_rope = true;
         if (s.n_rot == 64)   // the native and prompt-path rope kernels read it (mrope.hpp)
             basalt::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, basalt::kernels::rope_scaling());
@@ -659,10 +734,20 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     return c.used;
 }
 
+void qsa_set_kv_elastic(int64_t floor_cells) { g_kv_elastic = floor_cells > 0 ? floor_cells : 0; }
+int64_t qsa_kv_elastic() { return g_kv_elastic; }
+
+void qsa_state_release(QsaState& st) {
+    delete st.kv_arena;
+    st.kv_arena = nullptr;
+}
+
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
     cudaStream_t cs = (cudaStream_t) stream;
-    const size_t rows = (size_t) st.n_slots * s.n_head_kv * s.page_size;
+    // elastic: only the backed pages (the rest has no memory; mapping more zeroes it)
+    const int64_t pages = st.kv_arena != nullptr ? st.kv_arena->cells() / s.page_size : st.n_slots;
+    const size_t rows = (size_t) pages * s.n_head_kv * s.page_size;
     if (st.kv_hybrid) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2, cs);
@@ -685,7 +770,10 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     if (st.kv_mode == 1) basalt::kernels::kv_stream_reset(st.map, stream);
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
-    cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
+    // elastic: the pooled rows of the backed pages and the spare rows past them (mapping more zeroes the rest)
+    const int64_t pooled_rows =
+        st.kv_arena != nullptr ? std::min(st.idx_pooled_rows, st.kv_arena->cells() / s.idx_block + 2) : st.idx_pooled_rows;
+    cudaMemsetAsync(st.idx_pooled, 0, (size_t) pooled_rows * s.idx_dim * 4, cs);
 }
 
 basalt::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
@@ -825,8 +913,8 @@ const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, 
         return false;
     }
 };
-// ---- resolve every tensor by name, and REFUSE rather than reading a null.  `check_layer` has already
-// asserted the shapes at load time; a missing name here is a wiring mistake.
+// ---- resolve every tensor by name, and REFUSE rather than reading a null.  `check_all` has already
+// asserted the shapes at engine start; a missing name here is a wiring mistake.
 struct Req { const char* suf; };    const WeightRef* w_idxk = v.get("indexer.k_proj.weight");    const WeightRef* w_attnq = v.get("attn_q.weight");    const WeightRef* w_attnk = v.get("attn_k.weight");    const WeightRef* w_attnv = v.get("attn_v.weight");    const WeightRef* w_attno = v.get("attn_output.weight");    const WeightRef* w_idxq = v.get("indexer.q_proj.weight");    const WeightRef* w_qn = v.get("attn_q_norm.weight");    const WeightRef* w_kn = v.get("attn_k_norm.weight");    const WeightRef* w_iqn = v.get("indexer.q_norm.weight");    const WeightRef* w_ikn = v.get("indexer.k_norm.weight");    const char* missing = !w_idxk ? "indexer.k_proj.weight" : !w_attnq ? "attn_q.weight"                          : !w_attnk ? "attn_k.weight" : !w_attnv ? "attn_v.weight"                          : !w_attno ? "attn_output.weight" : !w_idxq ? "indexer.q_proj.weight"                          : !w_qn ? "attn_q_norm.weight" : !w_kn ? "attn_k_norm.weight"                          : !w_iqn ? "indexer.q_norm.weight" : !w_ikn ? "indexer.k_norm.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }    if (pos < 0 || pos >= st.max_cells) {        err = "qsa_layer: pos " + std::to_string(pos) + " is outside the state's 0.." +              std::to_string(st.max_cells - 1);        return false;    }
 // THE TWO BF16 PROJECTIONS: the arena holds them re-rounded to 2 B/elem, which is what `bf16_gemv` wants.  Reading one
 // as f32 would walk 2x its length inside the arena without faulting.

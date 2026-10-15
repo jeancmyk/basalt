@@ -36,6 +36,9 @@ struct SessionState {
 
     QsaState* qsa_states = nullptr;      ///< one per QSA layer
     void* qsa_state_arena = nullptr;
+    /// Elastic arenas of state that grows with the sequence but is not a QSA layer of this session (the MTP draft
+    /// layer's K/V): `session_kv_*` below map and give back theirs with the layers'.  Not owned.
+    std::vector<KvArena*> kv_extra;
     QsaBuffers qsa_bufs;                 ///< scratch, shared across the 12 (they never run concurrently)
     void* qsa_buf_arena = nullptr;
 
@@ -99,6 +102,17 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the rope
 /// kernels' registered angle table), so a later session never rotates by freed memory.
 void session_release(SessionState& s);
+
+/// The elastic KV of a session's QSA layers (qsa_set_kv_elastic).  `session_kv_cells`: the cells every layer has
+/// backed (-1: not elastic, every cell is).  `session_kv_grow_bytes`: the VRAM backing `cells` would add.  `map`
+/// backs at least `cells` cells in every layer (zeroed); `unmap` gives back what lies past `cells`.
+int64_t session_kv_cells(const SessionState& s);
+uint64_t session_kv_grow_bytes(const SessionState& s, int64_t cells);
+uint64_t session_kv_bytes_for(const SessionState& s, int64_t cells);
+/// The VRAM backing the session's elastic KV now (0 when it is not elastic).
+uint64_t session_kv_mapped_bytes(const SessionState& s);
+bool session_kv_map(SessionState& s, int64_t cells, std::string& err);
+bool session_kv_unmap(SessionState& s, int64_t cells, std::string& err);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);

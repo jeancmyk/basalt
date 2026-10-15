@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -127,7 +129,11 @@ THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
 # vision markers are special only where the template writes them for an image item
 VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
                "<|video_pad|>": "\U000F0E06"}
-LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS}
+# The tool-call tags are special tokens the tokenizer matches in any text; a quoted one would hand the model the real
+# marker. An assistant message keeps its own, since a client replaying raw call text sends the tokens the model wrote.
+TOOL_LITERAL_TAGS = {"</tool_call>": "\U000F0E07", "<tool_call>": "\U000F0E08", "<tool_response>": "\U000F0E09",
+                     "</tool_response>": "\U000F0E0A"}
+LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS, **TOOL_LITERAL_TAGS}
 THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
 CONTROL_MARK0 = 0xF0E10      # control-token marks start here
 
@@ -165,23 +171,63 @@ def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
     return False
 
 
+_TOOL_RESULT_OPEN, _TOOL_RESULT_CLOSE = "<tool_response>", "</tool_response>"
+
+
+def _keep_tool_result_wrap(content, tags: dict[str, str]):
+    """A user message whose whole text is <tool_response>...</tool_response> (a client that formats a tool result the way
+    the template does) keeps that outer pair as the markers, since the template tells such a turn from a question by
+    exactly that pair; only the text inside is marked. None: not such a message."""
+    o, c = _TOOL_RESULT_OPEN, _TOOL_RESULT_CLOSE
+
+    def wrapped(text: str) -> bool:
+        body = text.strip()
+        return len(body) >= len(o) + len(c) and body.startswith(o) and body.endswith(c)
+
+    def wrap(text: str, first: bool, last: bool) -> str:
+        i = text.index(o) + len(o) if first else 0
+        j = text.rindex(c) if last else len(text)
+        head = _mark(text[:i - len(o)], tags) + o if first else ""
+        tail = c + _mark(text[j + len(c):], tags) if last else ""
+        return head + _mark(text[i:j], tags) + tail
+
+    if isinstance(content, str):
+        return wrap(content, True, True) if wrapped(content) else None
+    if not (isinstance(content, list) and content and all(isinstance(x, dict) and isinstance(x.get("text"), str)
+                                                          for x in content)):
+        return None
+    texts = [x["text"] for x in content]
+    if not wrapped("".join(texts)) or not (texts[0].lstrip().startswith(o) and texts[-1].rstrip().endswith(c)):
+        return None          # the pair is split inside a part: mark it all
+    if len(content) == 1:
+        return [{**content[0], "text": wrap(texts[0], True, True)}]
+    return ([{**content[0], "text": wrap(texts[0], True, False)}] + [_mark_deep(x, tags) for x in content[1:-1]] +
+            [{**content[-1], "text": wrap(texts[-1], False, True)}])
+
+
 def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str, str] = LITERAL_TAGS):
     """(messages, tools, changed) with literal tags in their text swapped for `tags`' marks; unchanged objects come
     back when there are none. An assistant message opening with a whole <think>...</think> block keeps it."""
     if not _has_tag(messages, tags) and not _has_tag(tools, tags):
         return messages, tools, False
     out = []
+    own = {t: v for t, v in tags.items() if t not in TOOL_LITERAL_TAGS}     # what an assistant message keeps as written
     for m in messages:
         m = dict(m)
         content = m.get("content")
+        mine = own if m.get("role") == "assistant" else tags
         for k, v in m.items():
             if k != "role":
-                m[k] = _mark_deep(v, tags)
+                m[k] = _mark_deep(v, mine)
+        if m.get("role") == "user":
+            kept = _keep_tool_result_wrap(content, tags)
+            if kept is not None:
+                m["content"] = kept
         if m.get("role") == "assistant" and isinstance(content, str) and content.lstrip().startswith("<think>") \
                 and "</think>" in content:
             i, j = content.index("<think>") + len("<think>"), content.index("</think>")
-            m["content"] = (content[:i] + _mark(content[i:j], tags) + "</think>" +
-                            _mark(content[j + len("</think>"):], tags))
+            m["content"] = (content[:i] + _mark(content[i:j], own) + "</think>" +
+                            _mark(content[j + len("</think>"):], own))
         out.append(m)
     return out, _mark_deep(tools, tags), True
 
@@ -227,6 +273,44 @@ def _object_list(value, name: str) -> list[dict]:
     return value
 
 
+_TOOL_ORDERS: "OrderedDict[tuple, None]" = OrderedDict()   # orders of tool names seen, least recently used first
+_TOOL_ORDERS_LOCK = threading.Lock()
+_TOOL_ORDERS_MAX = 64
+
+
+def stable_tool_order(tools: list[dict], name_of) -> list[dict]:
+    """Put `tools` in the order their names were first seen, so a client that lists the same tools in another order
+    keeps the prompt prefix (the template renders tools before the system prompt, so one swap re-reads the whole
+    conversation). The closest remembered order that shares at least half the names decides: its tools keep its
+    order and tools it lacks follow in the order sent, which moves the prefix back the least. A tool set with no such
+    relative, a single tool, or duplicate names is left as sent. Based on Strata 1a62f6d."""
+    if len(tools) < 2:
+        return tools
+    names = [name_of(t) for t in tools]
+    have = set(names)
+    if len(have) != len(names):
+        return tools
+    with _TOOL_ORDERS_LOCK:
+        best, shared = None, 0
+        for order in reversed(_TOOL_ORDERS):         # most recent first, so ties go to the newest
+            n = len(have.intersection(order))
+            if n > shared:
+                best, shared = order, n
+        if best is None or shared * 2 < len(names):
+            result = tuple(names)
+        else:
+            known = set(best)
+            result = tuple([n for n in best if n in have] + [n for n in names if n not in known])
+        _TOOL_ORDERS.pop(result, None)
+        _TOOL_ORDERS[result] = None
+        while len(_TOOL_ORDERS) > _TOOL_ORDERS_MAX:
+            _TOOL_ORDERS.popitem(last=False)
+    if list(result) == names:
+        return tools
+    pos = {n: k for k, n in enumerate(result)}
+    return sorted(tools, key=lambda t: pos[name_of(t)])
+
+
 def _tool_list(value, wrapper: str | None) -> list[dict]:
     """A request's tools as named objects, in the OpenAI shape (`wrapper` "function") or Anthropic's (None);
     anything else is a ValueError, no value is no tools. A tool's schema ("parameters" / "input_schema") is an object
@@ -248,7 +332,7 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
         if schema is not None and not isinstance(schema, dict):
             raise ValueError(f'tools[{i}] ({fn["name"]}): "{key}" must be an object (the JSON schema of its '
                              f"parameters), not {type(schema).__name__}")
-    return tools
+    return stable_tool_order(tools, lambda t: (t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t)["name"])
 
 
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
@@ -440,13 +524,61 @@ def call_end(text: str) -> int:
             return text.find(CALL_END, pos)
 
 
+def tool_choice_of(tool_choice) -> tuple[str, str | None]:
+    """A client's `tool_choice` in any API's shape -> ("auto" | "none" | "required" | "named", name).
+    OpenAI: "auto" / "none" / "required", {"type": "function", "function": {"name": N}} or the flat
+    {"type": "function", "name": N} (Responses, with an optional "namespace"); Anthropic: {"type": "auto" | "any" |
+    "none"} and {"type": "tool", "name": N}.  A value it does not know is a ValueError."""
+    if tool_choice is None:
+        return "auto", None
+    if isinstance(tool_choice, str):
+        if tool_choice in ("auto", "none", "required"):
+            return tool_choice, None
+    elif isinstance(tool_choice, dict):
+        kind = tool_choice.get("type")
+        if kind in ("auto", "none"):
+            return kind, None
+        if kind in ("any", "required"):
+            return "required", None
+        if kind in ("function", "tool", "custom"):
+            fn = tool_choice.get("function")
+            name = (fn.get("name") if isinstance(fn, dict) else None) or tool_choice.get("name")
+            if isinstance(name, str) and name:
+                space = tool_choice.get("namespace")
+                return "named", f"{space}.{name}" if isinstance(space, str) and space else name
+            raise ValueError("tool_choice: a named choice needs the tool's name")
+    raise ValueError(f"tool_choice: unsupported value {json.dumps(tool_choice)[:120]}; use auto, none, required "
+                     "(Anthropic: any) or a named tool")
+
+
+def forced_call(tool_choice, tools: list[dict] | None) -> tuple[list[dict] | None, str | None]:
+    """`tool_choice` -> (the tools to offer, the text that opens the call the reply must make or None).
+    "none" offers no tools.  There is no grammar: the server writes the opening itself, so the model can only go on
+    with a call.  "required" / Anthropic "any": any tool (the only one is named); a named tool: that one.  A forced
+    choice with no tools, or naming a tool the request lacks, is a ValueError."""
+    kind, name = tool_choice_of(tool_choice)
+    if kind == "none":
+        return None, None
+    if kind in ("auto", "none"):
+        return tools, None
+    names = [t.get("name") for t in tools or []]
+    if kind == "required":
+        if not names:
+            raise ValueError("tool_choice: required needs at least one tool in the request")
+        if len(names) == 1:
+            name = names[0]
+    elif name not in names:
+        raise ValueError(f"tool_choice: the request has no tool named {name!r}")
+    return tools, CALL_START + (f"\n<function={name}>\n" if name else "\n<function=")
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>...</function>` -> ToolCall. Values are JSON-decoded when the schema says non-string
     (without a schema: when they parse as JSON objects, arrays, numbers or booleans)."""
     body = body.strip()
     if not body.startswith("<function=") or ">" not in body:
         raise ValueError("malformed tool call: " + body[:80])
-    name = body[len("<function="):body.index(">")]
+    name = body[len("<function="):body.index(">")].strip()      # a stray space after `=`
     rest = body[body.index(">") + 1:]
     props = ((schema or {}).get("parameters") or {}).get("properties") or {}
     args = {}
@@ -479,6 +611,7 @@ class OutputParser:
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
+        self.rtail = ""              # last reasoning character sent
         self.schemas = {t.get("name"): t for t in tools or []}
         # stream_tools: also report a call while it is written ("tool_start", "tool_args" pieces) before "tool_call"
         self.stream_tools = stream_tools
@@ -532,7 +665,7 @@ class OutputParser:
                 b = rest.find(">", a + 10) if a >= 0 else -1
                 if b < 0:
                     return out
-                name = rest[a + 10:b]
+                name = rest[a + 10:b].strip()
                 self.scall = ToolCall(name=name, arguments={})
                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
                 self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
@@ -621,6 +754,23 @@ class OutputParser:
         self.ss = "done"
         return out
 
+    def _reasoning(self, text: str) -> Event:
+        """A reasoning event for text going out; remembers its last character for the quote check."""
+        self.rtail = text[-1:] or self.rtail
+        return Event("reasoning", text)
+
+    def _quoted_think_end(self, i: int) -> bool | None:
+        """Whether the `</think>` at self.buf[i] is the model quoting the tag while it thinks: written right after a
+        quote or backtick and followed by anything but a line break. None while the character after it has not
+        arrived."""
+        before = self.buf[i - 1] if i else self.rtail
+        if before not in ('"', "'", "`"):
+            return False
+        after = self.buf[i + len(THINK_END):]
+        if not after:
+            return None
+        return after[0] not in "\r\n"
+
     def _hold(self, text: str, tags: tuple[str, ...]) -> int:
         """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
         best = 0
@@ -639,11 +789,21 @@ class OutputParser:
                 if i < 0:
                     keep = self._hold(self.buf, (THINK_END,))
                     if len(self.buf) > keep:
-                        out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
+                        out.append(self._reasoning(self.buf[:len(self.buf) - keep]))
                         self.buf = self.buf[len(self.buf) - keep:]
                     return out
+                quoted = self._quoted_think_end(i)
+                if quoted is None:                   # held like a partial tag until the character after it is here
+                    if i:
+                        out.append(self._reasoning(self.buf[:i]))
+                        self.buf = self.buf[i:]
+                    return out
+                if quoted:                           # a quoted tag is reasoning text
+                    out.append(self._reasoning(self.buf[:i + len(THINK_END)]))
+                    self.buf = self.buf[i + len(THINK_END):]
+                    continue
                 if i:
-                    out.append(Event("reasoning", self.buf[:i]))
+                    out.append(self._reasoning(self.buf[:i]))
                 self.buf = self.buf[i + len(THINK_END):]
                 self.state, self.lead = "content", True
                 self.fence, self.line, self.ticks = "", "", 0     # the answer's own text starts here
@@ -691,7 +851,7 @@ class OutputParser:
                     return out
                 body = self.buf[:i]
                 self.buf = self.buf[i + len(CALL_END):]
-                name = body.strip()[len("<function="):].split(">", 1)[0]
+                name = body.strip()[len("<function="):].split(">", 1)[0].strip()
                 call = parse_tool_call(body, self.schemas.get(name))
                 if self.scall is not None:
                     call.id = self.scall.id
@@ -710,6 +870,8 @@ class OutputParser:
             self.buf = ""
             self._reset_scan()
             return out
+        if self.state == "reasoning" and self.buf == THINK_END:     # the output ends on a held tag: the thinking's end
+            self.buf, self.state = "", "content"
         if self.buf:
             kind = {"reasoning": "reasoning", "content": "content"}.get(self.state, "content")
             text = self.buf if self.state != "call" else CALL_START + self.buf
