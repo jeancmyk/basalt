@@ -5,11 +5,12 @@
   </picture>
 </p>
 
-> **Basalt-Windows** — private fork of [jesdga95/basalt](https://github.com/jesdga95/basalt) carrying a native
-> Windows port. Before working here, read **[WINDOWS-PORT-AUDIT.md](WINDOWS-PORT-AUDIT.md)**: it maps every
-> Linux-only call site in this tree and which file of the parent project Strata already ships a Windows
-> implementation of. The port plan is 15 files; engine semantics (kernels, formats, precision rules) are
-> unchanged from upstream, so upstream's `AGENTS.md` and `CONTRIBUTING.md` still apply.
+> **Basalt-Windows** — fork of [jesdga95/basalt](https://github.com/jesdga95/basalt) with a **native Windows x64
+> port**: the same engine, kernels and precision rules, plus a platform layer for MSVC and CUDA 13 on Windows.
+> Build steps, the test notes and the platform caveats are in **[docs/WINDOWS.md](docs/WINDOWS.md)**; the pre-port
+> audit that mapped every Linux-only call site is at
+> **[WINDOWS-PORT-AUDIT.md](WINDOWS-PORT-AUDIT.md)**. Engine semantics are unchanged from upstream, so
+> upstream's `AGENTS.md` and `CONTRIBUTING.md` still apply.
 
 Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model. It targets one thing:
 Linux with an NVIDIA Blackwell GPU (sm_120). The experts that do not fit in VRAM live in system RAM (and optionally on
@@ -37,6 +38,8 @@ It is a fork of [Strata](https://github.com/Niko1221/Strata) (MIT), stripped dow
 ## Requirements
 
 - Linux x86-64 with AVX2 (AVX-512 is used when present).
+- This fork also builds natively on **Windows x64** (MSVC 2022 + CUDA 13, same sm_120 requirement); the
+  working toolchain, the build recipe and the test caveats are in [docs/WINDOWS.md](docs/WINDOWS.md).
 - An NVIDIA Blackwell GPU (compute capability 12.0) and CUDA 13.
 - CMake 3.24 or newer and a C++20 compiler.
 - Enough system RAM to hold the experts that do not fit in VRAM.
