@@ -21,28 +21,48 @@
 
 namespace basalt::platform {
 
+#if defined(_WIN32)
+namespace {
+/// Enables one privilege in this process's token. A privilege can be assigned to the account and still be absent
+/// from the token until the process asks for it, which is the normal state for an interactive one.
+void enable_privilege(LPCWSTR name) {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) return;
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    if (LookupPrivilegeValueW(nullptr, name, &tp.Privileges[0].Luid)) {
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        (void) AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr);
+    }
+    CloseHandle(tok);
+}
+}  // namespace
+#endif
+
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
     if (p == nullptr || bytes == 0) { r.note = "nothing to lock"; return r; }
 #if defined(_WIN32)
+    enable_privilege(L"SeIncreaseWorkingSetPrivilege");   // to raise this process's working set
+    enable_privilege(L"SeLockMemoryPrivilege");          // and to lock pages in it
     HANDLE self = GetCurrentProcess();
     SIZE_T min_ws = 0, max_ws = 0;
     DWORD flags = 0;
-    if (!GetProcessWorkingSetSizeEx(self, &min_ws, &max_ws, &flags)) {
-        r.note = "GetProcessWorkingSetSizeEx failed (error " + std::to_string(GetLastError()) + ")";
-        return r;
-    }
     // Locked pages count against the minimum working set, so it has to grow by the region plus room for the rest of
-    // the process before the lock: the pages VirtualLock may hold is the minimum less what is already resident.
-    // Both limits are soft, so raising the minimum reserves without pinning the process to it.
-    const SIZE_T margin = (SIZE_T) 512 << 20;
-    const SIZE_T new_min = min_ws + (SIZE_T) bytes + margin;
-    const SIZE_T new_max = max_ws > new_min + margin ? max_ws : new_min + margin;
-    if (!SetProcessWorkingSetSizeEx(self, new_min, new_max,
-                                    QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
-        r.note = "SetProcessWorkingSetSizeEx(" + std::to_string((unsigned long long) (new_min >> 20)) +
-                 " MiB) failed (error " + std::to_string(GetLastError()) + ")";
-        return r;
+    // the process first. Both limits are soft, so raising the minimum reserves without pinning the process to it.
+    // A quota that cannot be raised is reported and the lock tried anyway: whatever the existing quota covers is
+    // still worth having.
+    std::string quota_note;
+    if (!GetProcessWorkingSetSizeEx(self, &min_ws, &max_ws, &flags)) {
+        quota_note = "GetProcessWorkingSetSizeEx failed (error " + std::to_string(GetLastError()) + ")";
+    } else {
+        const SIZE_T margin = (SIZE_T) 512 << 20;
+        const SIZE_T new_min = min_ws + (SIZE_T) bytes + margin;
+        const SIZE_T new_max = max_ws > new_min + margin ? max_ws : new_min + margin;
+        if (!SetProcessWorkingSetSizeEx(self, new_min, new_max,
+                                        QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE))
+            quota_note = "SetProcessWorkingSetSizeEx(" + std::to_string((unsigned long long) (new_min >> 20)) +
+                         " MiB) failed (error " + std::to_string(GetLastError()) + ")";
     }
     // Chunked, because one call over the whole region loses everything past the first page that does not fit.
     const uint64_t chunk = 1ull << 30;
@@ -50,7 +70,8 @@ LockResult lock_resident(void* p, uint64_t bytes) {
     for (uint64_t off = 0; off < bytes; off += chunk) {
         const uint64_t n = bytes - off < chunk ? bytes - off : chunk;
         if (!VirtualLock(base + off, (SIZE_T) n)) {
-            r.note = "VirtualLock stopped at " + std::to_string((unsigned long long) (off >> 20)) + " of " +
+            r.note = (quota_note.empty() ? "" : quota_note + "; ") + "VirtualLock stopped at " +
+                     std::to_string((unsigned long long) (off >> 20)) + " of " +
                      std::to_string((unsigned long long) (bytes >> 20)) + " MiB (error " +
                      std::to_string(GetLastError()) + ")";
             r.ok = off > 0;   // what it did lock stays locked; the rest of the region is merely pageable
@@ -59,8 +80,9 @@ LockResult lock_resident(void* p, uint64_t bytes) {
         r.locked_bytes = off + n;
     }
     r.ok = true;
-    r.note = "locked " + std::to_string((unsigned long long) (bytes >> 20)) +
-             " MiB via working-set minimum + VirtualLock";
+    const std::string locked = std::to_string((unsigned long long) (bytes >> 20)) + " MiB";
+    r.note = quota_note.empty() ? "locked " + locked + " via working-set minimum + VirtualLock"
+                                : quota_note + "; locked " + locked + " with the quota already in place";
     return r;
 #else
     if (mlock(p, bytes) != 0) { r.note = "mlock failed (raise ulimit -l)"; return r; }
