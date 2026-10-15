@@ -807,12 +807,16 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING)
-  add_executable(cpu_quota_test src/kernels/cpu/cpu_quota_test.cpp)
-  target_link_libraries(cpu_quota_test PRIVATE kernels_cpu)
-  add_test(NAME cpu_quota_test COMMAND cpu_quota_test)
-  add_executable(pool_affinity_test src/kernels/cpu/pool_affinity_linux_test.cpp)
-  target_link_libraries(pool_affinity_test PRIVATE kernels_cpu)
-  add_test(NAME pool_affinity_test COMMAND pool_affinity_test)
+  # Both programs test a Linux-only surface: the cgroup quota files and the Linux affinity backend's headers.
+  # Neither exists on Windows, so neither is built or run there.
+  if(NOT WIN32)
+    add_executable(cpu_quota_test src/kernels/cpu/cpu_quota_test.cpp)
+    target_link_libraries(cpu_quota_test PRIVATE kernels_cpu)
+    add_test(NAME cpu_quota_test COMMAND cpu_quota_test)
+    add_executable(pool_affinity_test src/kernels/cpu/pool_affinity_linux_test.cpp)
+    target_link_libraries(pool_affinity_test PRIVATE kernels_cpu)
+    add_test(NAME pool_affinity_test COMMAND pool_affinity_test)
+  endif()
   # one expert applied to several tokens, bitwise vs the single-token kernel (synthetic, CPU only).
   # the device dequantizers vs the artifact's CPU dequantizers on the real shards (not a ctest: needs
   # the full model; run it by hand)
