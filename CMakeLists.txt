@@ -726,6 +726,13 @@ set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIO
 set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 # the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
 set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx1_flags}")
+# MSVC declares the scalar F16C conversions but compiles them to calls nothing answers, so the extracted ggml dot
+# products fail to link without them. The vector intrinsics do inline; this builds the scalar pair from them. The
+# file is empty for every other compiler, and it is not added to the library at all there.
+if(MSVC)
+  target_sources(kernels_cpu PRIVATE src/kernels/cpu/ggml/f16c_scalar_msvc.c)
+  set_source_files_properties(src/kernels/cpu/ggml/f16c_scalar_msvc.c PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+endif()
 target_link_libraries(kernels_cpu PUBLIC ggml_quants)
   # the router lookahead's dot on each rung this CPU has (AVX2, the older CPUs' AVX1) against a double reference
 add_executable(router_dot_parity src/kernels/cpu/router_dot_parity.cpp)
