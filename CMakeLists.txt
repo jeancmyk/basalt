@@ -41,14 +41,18 @@ set(_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 # globally they would also hit the extracted ggml C and CUDA sources, whose warnings are not this project's to fix.
 # The flags are guarded by COMPILE_LANGUAGE:CXX so nvcc never receives them as inputs, and by the compiler id:
 # MSVC reads -Wall/-Wextra as /Wall and the invalid /Wextra, so it takes its own spellings. The sources are UTF-8,
-# which MSVC only assumes when told (the Windows SDK's headers are not), hence /utf-8 for both languages.
+# which MSVC only assumes when told (the Windows SDK's headers are not), hence /utf-8 for both languages. MSVC reports
+# __cplusplus as 199711L unless /Zc:__cplusplus is given; headers that gate alignment on that value then drop their
+# alignas entirely, which misaligns TMA descriptors packed into kernel argument structs.
 add_library(warnings INTERFACE)
 target_compile_options(warnings INTERFACE
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/utf-8>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/Zc:__cplusplus>
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wall>
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wextra>
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/utf-8>)
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/utf-8>
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/Zc:__cplusplus>)
 if(WERROR)
   target_compile_options(warnings INTERFACE
     $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/WX>

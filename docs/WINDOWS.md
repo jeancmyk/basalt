@@ -110,7 +110,7 @@ pretending otherwise:
 
 ## Compiler notes worth knowing
 
-Three things about MSVC cost real time and are worth recording:
+Four things about MSVC cost real time and are worth recording:
 
 - `/arch:AVX2` defines `__AVX__` and `__AVX2__` but **not** `__F16C__`; `/arch:AVX512` adds
   `F`/`BW`/`VL`/`DQ` but not `F16C`, `VNNI` or `VBMI` - although the intrinsics for all of those
@@ -129,6 +129,16 @@ Three things about MSVC cost real time and are worth recording:
   quantization uses the F16C intrinsic pair, and the BF16 kernel's run-time probe reads the same
   CPUID leaves and XCR0 bits GCC's probe consults. The AVX-512 BF16 types themselves need no
   change: MSVC spells `__m256bh` and `__m512bh` as typedefs of the integer vectors.
+- MSVC reports `__cplusplus` as `199711L` unless `/Zc:__cplusplus` is passed. The CUDA driver header
+  defines `CUtensorMap` with `alignas(TENSOR_MAP_ALIGN)` only when the reported value looks like
+  C++11 or later, so without that flag the type compiles with the natural 8-byte alignment instead of
+  64 (or 128, as reported by GCC). `hc_fused_kernel` passes six TMA descriptors in a
+  `__grid_constant__` argument struct; when the struct's alignment is wrong, every
+  `cp.async.bulk.tensor`/`prefetch.tensormap` faults with `cudaErrorMisalignedAddress`
+  (compute-sanitizer reports it as "Misaligned shared or local address"), which surfaces in the
+  engine as a stuck verify window. The build passes `/Zc:__cplusplus` to cl.exe and nvcc's host
+  pass for every Windows translation unit; the Linux build is untouched because GCC has always
+  reported the true standard version. Same class as CUTLASS issue 2905 and PyGPUkit issue 107.
 
 `GGML_EXTENSION` (a GCC `__extension__`) had to be guarded: it breaks every CUDA translation unit
 that includes the block-layout header on the Windows front end.
