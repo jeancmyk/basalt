@@ -145,15 +145,19 @@ that includes the block-layout header on the Windows front end.
 
 ## Benchmarks
 
-Not yet measured on Windows. The standard benchmark drives the engine as a child process over two
-pipes (`src/program/bench_main.cpp`); that spawn, the NVML reading from `nvml.dll` and the reply
-parsing all work natively, and `basalt-bench --help` runs.
+Not yet measured by the maintainer on Windows; a headline number is still pending. A development
+A/B run on this machine (RTX 5090, 575 W power limit; Windows 11, MSVC 19.44, CUDA 13.0; Q3 pack;
+llama-swap-equivalent config: 524288 context, yarn, `--kv int8`, `--spec 7 --spec-min-p 0.5`,
+`--ple-io ram`, `--kv-resident 32768`) measured, as a sanity check only:
 
-The numbers themselves need the pack, which is an ~80 GB download from Hugging Face and has not
-been approved yet. Until they exist they are not quoted here. The Linux baseline they will be
-compared against is 585 tok/s structured decode, 316 tok/s prose decode and 7317 tok/s prefill on
-one RTX 5090 with a 400 W limit; every number in this project is labelled with the power limit it
-was taken at.
+- prefill: 64,437 prompt tokens read in 11 s (~5,860 tok/s)
+- decode: 12,299 tokens (reasoning + answer) in 56 s (~220 tok/s steady state)
+
+These are not a headline figure. The reference the port is checked against is the maintainer's WSL2
+setup on this same box (~214 tok/s at 524k context) and the published single-5090 Linux figures
+(585 tok/s structured decode, 316 tok/s prose decode, 7,317 tok/s prefill, 400 W power limit), which
+a maintainer run on Windows should match at its own power limit. Every number is labelled with the
+power limit it was taken at.
 
 ## Machine-specific observations
 
