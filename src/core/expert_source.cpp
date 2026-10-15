@@ -35,6 +35,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <fcntl.h>   // _open
+#include <io.h>      // _close
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -482,7 +484,10 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
     if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: mmap failed on " + path; return false; }
 #endif
 #if defined(_WIN32)
-    fd_ = -1;
+    // A second, plain descriptor for the prompt path's positional reads: the view stays read-only for the compute,
+    // while the staging buffers are filled with reads that do not fault mapping pages in. A failure here is not
+    // fatal - the caller falls back to copying from the view.
+    fd_ = _open(path.c_str(), _O_RDONLY | _O_BINARY);
 #else
     fd_ = fd;
 #endif
@@ -554,7 +559,9 @@ void FileExpertSource::close() {
         munmap((void*) base_, (size_t) mapped_bytes_);
 #endif
     }
-#if !defined(_WIN32)
+#if defined(_WIN32)
+    if (fd_ >= 0) _close(fd_);
+#else
     if (fd_ >= 0) ::close(fd_);
 #endif
     fd_ = -1;
