@@ -1,8 +1,10 @@
-/* The two scalar F16C conversions, for a compiler that declares them but never generates them.
+/* The two scalar F16C conversions for MSVC.
  *
- * MSVC turns _cvtss_sh and _cvtsh_ss into calls and no library answers them, so anything that uses them fails to
- * link. The vector forms do inline, and they are the same instruction with the same result: this builds the scalar
- * pair out of them. The rounding mode is a constant in the intrinsic, so the four cases are written out.
+ * MSVC's headers never declare the pair, and with __F16C__ defined the compiler claims the names as its own:
+ * a definition compiled under that macro does not build as written. This file is therefore compiled without
+ * __F16C__ (see the CMake wiring), the callers carry prototypes and #pragma function so the calls reach these
+ * definitions, and the bodies use the vector intrinsics, which are the same instruction with the same result.
+ * The rounding mode is a constant in the intrinsic, so the four cases are written out.
  *
  * Only the AVX2 and AVX-512 dot products reach these, and they run behind the run-time F16C probe.
  */
