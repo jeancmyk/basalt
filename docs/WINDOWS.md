@@ -57,6 +57,31 @@ fixtures fail to open and the tests report a creation error rather than a numeri
 Two tests are not built on Windows at all, because they exercise a Linux-only surface: the cgroup
 CPU-quota probe (`cpu_quota_test`) and the Linux affinity backend (`pool_affinity_test`).
 
+### When a failure is the machine and not the code
+
+Most of what looks like a test failure on Windows is the environment. Two checks separate them
+before any debugging:
+
+- **Run the test binary from a directory outside the build tree.** A filtered token, a security
+  product's folder rule or a working-directory restriction can deny file creation to a child
+  process. The same binary in the same session then passes from another directory, which is the
+  proof that the code is fine. `gguf_reader_test`, `gguf_split_test`, `model_file_test`,
+  `expert_profile_save_test`, `native_dense_ple_key_test`, `file_expert_source_test`,
+  `ple_reader_selftest` and `dec_gdn_parity` all behave this way.
+- **Read the mechanism, not the verdict.** `platform_memory_test` prints its own diagnosis when it
+  fails: `lock_resident: ok=0 ... SetProcessWorkingSetSizeEx failed (error 1314); VirtualLock
+  stopped at 0 of 256 MiB (error 1453)`. Those are token-privilege errors, not parity errors, and
+  the test passes where the privileges are held.
+
+Two tests need an `experts.bin` fixture in the working directory that is a developer's local file
+and is not in the repository: `expert_parity` and `pool_test` fail with "cannot read expert 0
+(layer 0) from experts.bin" until one is supplied with `--file`.
+
+The real-weight tools (`ple_q5_parity`, `expert_parity --file`, `pool_test --file`) want a **raw
+GGUF or a raw `experts.bin`**, not a `.basalt` container. Handing them a container makes them
+decode arbitrary bytes: they either report nonsense or fault. `ple_q5_parity` exits with
+`0xc0000409` that way.
+
 ## Memory residency
 
 Two different Windows limits matter, and they need two different privileges. Both are commonly
