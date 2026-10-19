@@ -565,6 +565,8 @@ ReadProbe probe_reads(const std::string& path, uint32_t read_bytes, uint32_t dep
     }
     r.seconds = (now_us() - t0) / 1e6;
     r.reads = reads;
+    r.read_bytes = read_bytes;
+    r.depth = depth;
     for (uint32_t j = 0; j < depth; ++j) DirectFile::free_aligned(buf[j]);
     r.ok = r.seconds > 0;
     return r;

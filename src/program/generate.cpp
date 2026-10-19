@@ -3393,6 +3393,28 @@ int main(int argc, char** argv) {
             basalt::log::raw("                 PROFILE, ranked by routing frequency, no eviction.\n");
         }
     }
+    // THE MEMORY REPORT.  One place for the host, the arena, the VRAM budget and the file I/O, printed here rather
+    // than before the cache is sized so the tier it describes is the tier that was planned.  Only with
+    // --memory-report: nothing above or below pays for it otherwise, not even the probes, which are one-time and
+    // cached so a later reprint does not measure again.
+    basalt::core::ReportFacts report_facts;
+    basalt::platform::ReadProbe report_read_probe;   // one measurement, reused by every reprint
+    bool report_read_probe_done = false;
+    auto mem_report = [&]() {
+        report_facts.tier_known = true;
+        report_facts.tier_bytes = (uint64_t) std::max<int64_t>(xcache.valid() ? xcache.bytes() : 0, 0);
+        report_facts.tier_slots = (uint64_t) std::max<int64_t>(xcache.valid() ? xcache.slots() : 0, 0);
+        report_facts.tier_full_bytes = (uint64_t) std::max<int64_t>(xcache.valid() ? xcache.full_bytes() : 0, 0);
+        report_facts.ple_io = ple_table.io_report();
+        if (!report_read_probe_done) {
+            // The PLE path's contract: 4 KiB reads, several in flight.  Its own reader, so the live one is untouched.
+            report_read_probe = basalt::platform::probe_reads(o.model, 4096, 32, 512);
+            report_read_probe_done = true;
+        }
+        report_facts.read_probe = report_read_probe;
+        basalt::core::print_memory_report(report_facts);
+    };
+    if (basalt::core::diagnostics().memory_report) mem_report();
     // ---- fill the tier from the profile.  This is the only place the plan is applied, and it runs
     // ONCE: with `slots` pairs and `slots` slots the cache is full when this returns, so the decode-time
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile

@@ -83,6 +83,8 @@ struct ReadProbe {
     uint64_t reads = 0;
     uint64_t bytes = 0;
     uint64_t failed = 0;
+    uint32_t read_bytes = 0;   ///< the size of each read, as asked for
+    uint32_t depth = 0;        ///< how many were in flight at once
     double seconds = 0;
     std::string error;
     double reads_per_s() const { return seconds > 0 ? (double) reads / seconds : 0.0; }
