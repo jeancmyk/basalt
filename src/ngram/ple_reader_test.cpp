@@ -129,6 +129,15 @@ int selftest(const std::string& dir, uint32_t rb) {
             }
             if (cache > 0) CHECK(rd.stats().cache_hits > 0, "the row cache never hit");
             CHECK(rd.cache_size() <= rd.cache_capacity(), "row cache exceeded its bound");
+            // The reader's file handle is what the memory report counts, so its queue has to be visible there.
+            const basalt::platform::IoStats ios = basalt::platform::io_stats();
+            CHECK(ios.submitted > 0 && ios.completed > 0, "io_stats saw no traffic (%llu submitted, %llu completed)",
+                  (unsigned long long) ios.submitted, (unsigned long long) ios.completed);
+            CHECK(ios.bytes > 0, "io_stats counted no bytes");
+            CHECK(ios.failed == 0, "io_stats counted %llu failed reads", (unsigned long long) ios.failed);
+            CHECK(ios.peak_inflight >= 1 && ios.peak_inflight <= inflight,
+                  "io_stats: peak depth %llu outside 1..%u", (unsigned long long) ios.peak_inflight, inflight);
+            if (thr) CHECK(ios.issuing_threads > 0, "io_stats saw no issuing thread");
         }
     }
     // fault injection: a 3 ms delay must be observed, and must not change the bytes
@@ -193,6 +202,17 @@ int selftest(const std::string& dir, uint32_t rb) {
         check_rows(rd, rows, N, rb, "keep-alive, caller thread");
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         CHECK(rd.snapshot().keepalive_reads == 0, "keep-alive without the worker thread");
+    }
+    {   // the one-time small-read probe the memory report runs: its own handle, spread over the file
+        const basalt::platform::ReadProbe pr = basalt::platform::probe_reads(path, 4096, 8, 64);
+        CHECK(pr.ok, "probe_reads: %s", pr.error.c_str());
+        if (pr.ok) {
+            CHECK(pr.reads == 64 && pr.failed == 0, "probe_reads: %llu reads, %llu failed",
+                  (unsigned long long) pr.reads, (unsigned long long) pr.failed);
+            CHECK(pr.bytes > 0 && pr.reads_per_s() > 0.0, "probe_reads reported no rate");
+            std::printf("probe_reads 4 KiB x %llu at depth 8: %.0f reads/s, %.1f MiB/s\n",
+                        (unsigned long long) pr.reads, pr.reads_per_s(), pr.gib_per_s() * 1024.0);
+        }
     }
     std::filesystem::remove(path);
     std::printf("ple_reader selftest (row_bytes=%u): %s\n", rb, g_fail ? "FAILED" : "OK");
