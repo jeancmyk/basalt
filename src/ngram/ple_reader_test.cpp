@@ -11,6 +11,7 @@
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/ngram/ple_reader.hpp"
 #include "basalt/platform/direct_file.hpp"
+#include "basalt/platform/memory.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -221,6 +222,15 @@ int selftest(const std::string& dir, uint32_t rb) {
                   (unsigned long long) pv.reads, (unsigned long long) pv.failed);
             std::printf("probe_reads 4 KiB with a held view: %.0f reads/s, %.1f MiB/s\n",
                         pv.reads_per_s(), pv.gib_per_s() * 1024.0);
+        }
+        // What the OS prefetch hint buys on a mapped view: one round of a small window, all three arms timed.
+        const basalt::platform::ViewFaultProbe vf = basalt::platform::probe_view_faults(path, 1ull << 20, 1, 1);
+        CHECK(vf.ok, "probe_view_faults: %s", vf.error.c_str());
+        if (vf.ok) {
+            CHECK(vf.off_seconds > 0.0 && vf.on_seconds > 0.0 && vf.early_seconds > 0.0,
+                  "probe_view_faults measured no time");
+            std::printf("probe_view_faults 1 MiB: no hint %.2f ms, hint %.2f ms, hint then a wait %.2f ms\n",
+                        vf.off_seconds * 1000.0, vf.on_seconds * 1000.0, vf.early_seconds * 1000.0);
         }
     }
     std::filesystem::remove(path);

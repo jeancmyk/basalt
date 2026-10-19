@@ -497,6 +497,33 @@ void print_memory_report(const ReportFacts& facts) {
         arm(facts.reads_after);
         arm(facts.reads_held_view);
     }
+    // What the OS prefetch hint buys on a mapped view: the cost of faulting a window with and without it, and with
+    // time for the hint to land. A rate near memory speed says the pages were cached, not read from the drive.
+    if (facts.view_faults.ok) {
+        const basalt::platform::ViewFaultProbe& f = facts.view_faults;
+        const double off_ms = f.off_seconds * 1000.0, on_ms = f.on_seconds * 1000.0, early_ms = f.early_seconds * 1000.0;
+        std::fprintf(stderr, "  probe view faults: %llu MiB x %u windows per arm: no hint %.1f ms (%.3f ms/MiB), "
+                             "hint %.1f ms (%.3f ms/MiB), hint then %.0f ms of other work %.1f ms (%.3f ms/MiB); "
+                             "hint/no-hint %.2fx, early/no-hint %.2fx\n",
+                     (unsigned long long) (f.window_bytes >> 20), f.windows_per_arm, off_ms, f.off_ms_per_mib(), on_ms,
+                     f.on_ms_per_mib(), f.wait_ms, early_ms, f.early_ms_per_mib(), off_ms > 0.0 ? on_ms / off_ms : 0.0,
+                     off_ms > 0.0 ? early_ms / off_ms : 0.0);
+        // The wait is real time, so the early arm is only a win if it survives it: the comparison that matters is the
+        // wait plus the timed fault against the unhinted fault, not the two timed regions against each other.
+        const double early_e2e = early_ms + f.wait_ms;
+        std::fprintf(stderr, "  probe view faults end to end: unhinted %.1f ms, unhinted WITH the hint %.1f ms, "
+                             "hinted early %.1f ms (%.1f ms of it the wait) = %.2fx against unhinted\n",
+                     off_ms, on_ms, early_e2e, f.wait_ms, off_ms > 0.0 ? early_e2e / off_ms : 0.0);
+        auto spread = [](double mean, double lo, double hi) { return mean > 0.0 && hi - lo > 0.2 * mean; };
+        if (spread(f.off_seconds, f.off_min, f.off_max) || spread(f.on_seconds, f.on_min, f.on_max) ||
+            spread(f.early_seconds, f.early_min, f.early_max))
+            std::fprintf(stderr, "  probe view faults spread: no hint %.1f-%.1f ms, hint %.1f-%.1f ms, early %.1f-%.1f "
+                                 "ms\n", f.off_min * 1000.0, f.off_max * 1000.0, f.on_min * 1000.0, f.on_max * 1000.0,
+                         f.early_min * 1000.0, f.early_max * 1000.0);
+    } else {
+        std::fprintf(stderr, "  probe view faults: not measured%s%s\n",
+                     facts.view_faults.error.empty() ? "" : ": ", facts.view_faults.error.c_str());
+    }
 }
 
 }  // namespace basalt::core
