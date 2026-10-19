@@ -59,6 +59,19 @@ process code page UTF-8 and lifts the path length limit.
   is created: a process started from a session that already exists cannot acquire a right assigned
   afterwards, and the enable call reports `ERROR_NOT_ALL_ASSIGNED` (1300). A 1300 in the start-up
   note means the grant has not taken effect yet, not that it was never made.
+  The large-page request is made in **1 GiB chunks into one reservation**, not as a single
+  all-or-nothing call, so a pool that is merely smaller than the arena can be told apart from one
+  that is absent. The arena has to stay one contiguous range - layer bounds index into it, the
+  registration covers it whole and the destructor releases it in one call - so the range is
+  reserved first and filled piece by piece; the chunk matches the ordinary commit chunk and is a
+  multiple of the 2 MiB page. The policy is **all large pages or all 4 KiB pages**: on the first
+  refused chunk the reservation goes back and the arena falls back whole, because a half-converted
+  arena would need a third backing state. The note says where the loop stopped and what it had
+  granted by then, so "pool exhausted part way" and "pool would not grant a single page" do not
+  read alike. The same shape applies to the Linux `MAP_HUGETLB` path, which is where the chunked
+  attempt is exercised against a real pool: there the reservation is `PROT_NONE`, the pieces are
+  `MAP_FIXED` over it, and the base is aligned up to 2 MiB by hand because the kernel only picks a
+  huge-page-aligned address when `addr` is NULL.
 - Shared arena files and cgroup quotas do not exist. The engine refuses the first and reports no
   container limit.
 - `basalt serve` runs the Python server as a child and exits with its status; Linux replaces
