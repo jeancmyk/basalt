@@ -130,6 +130,16 @@ inline uint64_t max_safe_copy(uint64_t avail, uint64_t late, uint64_t floor) {
 /// is false when the OS gives no reading (nothing is refused then).
 uint64_t ram_budget(bool* known = nullptr);
 
+/// The VRAM a plan may still take: the smaller of what the device reports free and what the process's assigned
+/// budget leaves. A process already at or past its budget has nothing left (0, never an underflow), and a query
+/// that did not answer leaves the device's own free figure as the only input.
+inline uint64_t vram_free_for_plan(uint64_t device_free, bool budget_known, uint64_t budget, uint64_t usage) {
+    if (!budget_known) return device_free;
+    if (usage >= budget) return 0;
+    const uint64_t left = budget - usage;
+    return left < device_free ? left : device_free;
+}
+
 /// Polls available_memory() until `stop_memory_watchdog`.  Below `floor_bytes` it prints a `basalt error:` line and
 /// _exit(1)s, so a load that is exhausting RAM ends before the machine starts to swap.
 void start_memory_watchdog(uint64_t floor_bytes);
