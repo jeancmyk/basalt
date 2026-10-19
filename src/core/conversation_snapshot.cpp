@@ -130,6 +130,11 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
 }
 } // namespace
 
+// The five buffers a state's K/V payload lives in: the authoritative side when the mode streams, the resident pool
+// otherwise.  Exposed so a caller - a test included - reads the same buffers the engine moves data through, rather
+// than re-deriving the three-way format branch and risking a different one.
+std::array<void*, 5> conversation_kv_pools(const QsaState& st, bool resident) { return pools(st, resident); }
+
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                                    int64_t upto, bool index, size_t& bytes, std::string& error) {
     Layout l{};
@@ -234,12 +239,39 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     if (st.kv_mode == 2 && upto > 0) {
         auto shapes = basalt::kernels::qsa_real_shapes();
         shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
-        // The image's own extent: the draft's is rounded down to the pages it publishes, so a refill of
-        // ceil(upto/page) pages would touch a page the image does not have.
+        // The image's own extent: the draft's is rounded down to the pages it publishes.
         const int64_t end = l.cells / l.page_size;
-        if (end > 0)
+        // A page the image does not publish must not stay readable: the host copy and the ring still hold the outgoing
+        // conversation's cells there.  Zero those cells in the host copy - the authoritative side, so every later
+        // refill carries the zeros - and refill the ring over the whole page range the token count names, so the ring
+        // receives them too.  A page that is merely "left out" of the refill keeps another conversation's K/V.
+        const int64_t token_pages = (upto + l.page_size - 1) / l.page_size;
+        if (token_pages > end) {
+            // Per-cell bytes from the GEOMETRY, not from the image: a short prefix publishes zero cells, so dividing
+            // the image's payload by l.cells would be a division by zero - and it is exactly that case, where the gap
+            // is the whole first page, that must be invalidated.
+            const bool int8_keys = st.kv_int8 || st.kv_hybrid;
+            const size_t per_cell = (size_t) g.n_head_kv *
+                    (st.kv_q4 ? (size_t) basalt::kernels::kv_q4_bytes_per_head((int) g.head_dim)
+                              : (size_t) g.head_dim * (int8_keys ? 1 : 2));
+            const size_t scale_cell = (size_t) g.n_head_kv *
+                    (int8_keys && !st.kv_q4 ? (size_t) (g.head_dim / 64) * 2 : 0);
+            const size_t gap_cells = (size_t) (token_pages - end) * (size_t) l.page_size;
+            const std::array<size_t,5> per = {per_cell, per_cell, scale_cell, scale_cell, 0};
+            for (size_t i = 0; i < per.size(); ++i) {
+                if (per[i] == 0 || dst[i] == nullptr) continue;
+                const size_t from = (size_t) end * (size_t) l.page_size * per[i];
+                const cudaError_t z = cudaMemset(static_cast<uint8_t*>(dst[i]) + from, 0, gap_cells * per[i]);
+                if (z != cudaSuccess) {
+                    error = std::string("conversation snapshot unpublished page: ") + cudaGetErrorString(z);
+                    return false;
+                }
+            }
+        }
+        if (token_pages > 0)
             basalt::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
-                                             std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, nullptr);
+                                             std::max<int64_t>(0, token_pages - st.n_slots), token_pages, st.n_slots,
+                                             shapes, nullptr);
     }
     const auto status = cudaGetLastError();
     if (status == cudaSuccess) return true;
@@ -274,7 +306,11 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     if (st.kv_mode == 2 && image.cells > 0) {
         const auto resident = pools(st, true);
         const int64_t end = image.cells / image.page_size;
-        const int64_t begin = std::max<int64_t>(0, end - st.n_slots);
+        // The ring holds the last n_slots pages the TOKEN COUNT names, and that range includes the unpublished gap
+        // page the restore zeroes.  Comparing from `end - n_slots` would read the slot the gap page evicted, so the
+        // lower bound follows the refill, not the image.
+        const int64_t token_pages = (upto + image.page_size - 1) / image.page_size;
+        const int64_t begin = std::max<int64_t>(0, token_pages - st.n_slots);
         for (size_t i = 0; i < 4; ++i) {
             if (saved[i]->empty()) continue;
             const size_t page_bytes = saved[i]->size() / size_t(end);

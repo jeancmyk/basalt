@@ -4,10 +4,17 @@
 #include "basalt/core/layer.hpp"
 #include "basalt/core/session.hpp"
 
+#include <array>
 #include <string>
 #include <thread>
 
 namespace basalt::core {
+
+/// The five buffers a state's K/V payload lives in, in the order the K/V functions use them: k, v, k_scale, v_scale,
+/// pooled.  `resident` picks the resident pool instead of the authoritative host copy.  A caller reads through this
+/// rather than re-deriving the format branch, so it cannot select a different buffer than the engine moves data
+/// through - the class of bug that cost this feature several rounds.
+std::array<void*, 5> conversation_kv_pools(const QsaState& state, bool resident);
 
 // Caller synchronizes the device before saving, and after restoring all layers.
 // include_index is false for the draft layer (its attention has no indexer).
