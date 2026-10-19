@@ -11,6 +11,7 @@
 #pragma once
 
 #include "basalt/platform/direct_file.hpp"
+#include "basalt/platform/memory.hpp"
 
 #include <cstdint>
 #include <string>
@@ -118,6 +119,7 @@ struct ReportFacts {
     ReadArm reads_before;                      ///< measured before any view of the file was created
     ReadArm reads_after;                       ///< measured with whatever this run maps
     ReadArm reads_held_view;                   ///< measured with a view the probe holds itself, for the comparison
+    basalt::platform::ViewFaultProbe view_faults;   ///< what faulting a view costs, with and without the hint
 };
 
 /// Print the consolidated memory report to stderr: host RAM and commit headroom, the process, the arena, the VRAM

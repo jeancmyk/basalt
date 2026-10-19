@@ -1,6 +1,8 @@
 // src/platform/memory.cpp - see include/basalt/platform/memory.hpp.
 #include "basalt/platform/memory.hpp"
 
+#include "basalt/platform/file.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -907,6 +909,123 @@ LargePageProbe probe_large_pages(uint64_t want) {
 #else
     (void) want;
 #endif
+    return p;
+}
+
+double ViewFaultProbe::off_ms_per_mib() const {
+    return window_bytes > 0 && off_seconds > 0 ? off_seconds * 1000.0 / ((double) window_bytes / 1048576.0) : 0.0;
+}
+double ViewFaultProbe::on_ms_per_mib() const {
+    return window_bytes > 0 && on_seconds > 0 ? on_seconds * 1000.0 / ((double) window_bytes / 1048576.0) : 0.0;
+}
+double ViewFaultProbe::early_ms_per_mib() const {
+    return window_bytes > 0 && early_seconds > 0 ? early_seconds * 1000.0 / ((double) window_bytes / 1048576.0) : 0.0;
+}
+
+namespace {
+#if defined(_WIN32)
+bool map_readonly(const std::string& path, void*& view, uint64_t& size) {
+    HANDLE fh = CreateFileW(to_wide(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (fh == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    const bool sized = GetFileSizeEx(fh, &sz) != 0;
+    if (sized) size = (uint64_t) sz.QuadPart;
+    HANDLE map = sized ? CreateFileMappingW(fh, nullptr, PAGE_READONLY, 0, 0, nullptr) : nullptr;
+    CloseHandle(fh);
+    if (map == nullptr) return false;
+    view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(map);
+    return view != nullptr;
+}
+void unmap_readonly(void* view, uint64_t) {
+    if (view != nullptr) UnmapViewOfFile(view);
+}
+#else
+bool map_readonly(const std::string& path, void*& view, uint64_t& size) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st{};
+    const bool sized = fstat(fd, &st) == 0 && st.st_size > 0;
+    if (sized) size = (uint64_t) st.st_size;
+    void* v = sized ? mmap(nullptr, (size_t) size, PROT_READ, MAP_PRIVATE, fd, 0) : MAP_FAILED;
+    ::close(fd);
+    if (v == MAP_FAILED) return false;
+    view = v;
+    return true;
+}
+void unmap_readonly(void* view, uint64_t size) {
+    if (view != nullptr) munmap(view, (size_t) size);
+}
+#endif
+
+/// Touch one byte of every page of [view, view + bytes): the cost measured is the fault, not the copy. `hint` issues
+/// the prefetch inside the timed region, because its cost is part of the answer; `wait_first` instead hints, waits
+/// `wait_ms` outside the clock, and then times the touch alone.
+double fault_window(const uint8_t* view, uint64_t bytes, int mode, uint32_t wait_ms) {
+    using clock = std::chrono::steady_clock;
+    if (mode == 2) {
+        advise_willneed(view, bytes);
+        if (wait_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+    }
+    const auto t0 = clock::now();
+    if (mode == 1) advise_willneed(view, bytes);
+    volatile uint8_t sink = 0;
+    for (uint64_t off = 0; off < bytes; off += 4096) sink = (uint8_t) (sink + view[off]);
+    const auto t1 = clock::now();
+    (void) sink;
+    return std::chrono::duration<double>(t1 - t0).count();
+}
+}  // namespace
+
+ViewFaultProbe probe_view_faults(const std::string& path, uint64_t window_bytes, uint32_t rounds, uint32_t wait_ms) {
+    ViewFaultProbe p;
+    p.window_bytes = window_bytes;
+    p.wait_ms = (double) wait_ms;
+    if (window_bytes < 4096 || rounds == 0) {
+        p.error = "probe: a window of at least one page and one round are needed";
+        return p;
+    }
+    constexpr uint32_t kArms = 3;
+    const uint32_t windows = rounds * kArms;
+    void* v = nullptr;
+    uint64_t size = 0;
+    if (!map_readonly(path, v, size)) { p.error = "probe: cannot map " + path; return p; }
+    unmap_readonly(v, size);
+    // one gap before the first window and one after the last, so no window is clipped
+    const uint64_t stride = size / (uint64_t) (windows + 1);
+    if (stride < window_bytes) { p.error = "probe: the file is too small for that many windows"; return p; }
+    double sum[kArms] = {0, 0, 0}, lo[kArms] = {0, 0, 0}, hi[kArms] = {0, 0, 0};
+    uint32_t n[kArms] = {0, 0, 0};
+    for (uint32_t r = 0; r < rounds; ++r) {
+        for (uint32_t k = 0; k < kArms; ++k) {
+            const uint32_t idx = r * kArms + k;
+            const uint64_t off = (uint64_t) (idx + 1) * stride;
+            // rotate which arm gets which of the round's windows, so no arm is always the colder one
+            const uint32_t mode = (k + r) % kArms;
+            void* view = nullptr;
+            uint64_t msize = 0;
+            if (!map_readonly(path, view, msize)) { p.error = "probe: cannot map " + path; return p; }
+            const double s = fault_window((const uint8_t*) view + off, window_bytes, (int) mode, wait_ms);
+            unmap_readonly(view, msize);
+            if (n[mode] == 0 || s < lo[mode]) lo[mode] = s;
+            if (n[mode] == 0 || s > hi[mode]) hi[mode] = s;
+            sum[mode] += s;
+            ++n[mode];
+        }
+    }
+    for (uint32_t a = 0; a < kArms; ++a)
+        if (n[a] == 0) { p.error = "probe: an arm did not run"; return p; }
+    p.off_seconds = sum[0] / (double) n[0];
+    p.off_min = lo[0];
+    p.off_max = hi[0];
+    p.on_seconds = sum[1] / (double) n[1];
+    p.on_min = lo[1];
+    p.on_max = hi[1];
+    p.early_seconds = sum[2] / (double) n[2];
+    p.early_min = lo[2];
+    p.early_max = hi[2];
+    p.windows_per_arm = n[0];
+    p.ok = true;
     return p;
 }
 
