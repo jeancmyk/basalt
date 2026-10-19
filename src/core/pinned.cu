@@ -295,6 +295,48 @@ StreamStats stream_bandwidth(const uint8_t* src, uint64_t bytes, uint64_t chunk,
 namespace {
 PinnedArena* g_report_arena = nullptr;
 
+/// Register ordinary host memory in `slice`-sized pieces until the driver refuses one, then release every piece that
+/// was accepted. The pages are touched before each registration, because cudaHostRegister pins what is resident and a
+/// region that has not been faulted in yet is a different (and cheaper) thing to pin than the arena's filled pages.
+HostRegisterProbe probe_host_register_impl(uint64_t slice_bytes, uint64_t max_bytes) {
+    HostRegisterProbe p;
+    p.slice_bytes = slice_bytes;
+    if (slice_bytes == 0 || max_bytes < slice_bytes) {
+        p.error = "the probe's slice or limit is too small";
+        return p;
+    }
+    std::vector<void*> pinned;   // one entry per accepted slice, released before the return
+    std::vector<void*> blocks;
+    const uint64_t slices = max_bytes / slice_bytes;
+    for (uint64_t i = 0; i < slices; ++i) {
+        // An ordinary host block, page-aligned and released as one piece. A request this size comes from the OS
+        // either way on both platforms; what the probe is measuring is the registration, not the mapping.
+        void* block = basalt::platform::alloc_aligned((size_t) slice_bytes, 4096);
+        if (block == nullptr) {
+            p.error = "cannot allocate another " + std::to_string(slice_bytes >> 20) + " MiB of host memory";
+            break;
+        }
+        blocks.push_back(block);
+        std::memset(block, 1, (size_t) slice_bytes);   // resident before it is pinned, like the arena's pages
+        if (cudaHostRegister(block, (size_t) slice_bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+            const cudaError_t e = cudaGetLastError();
+            p.refused_at = (uint64_t) pinned.size() * slice_bytes + slice_bytes;
+            p.error = std::string("cudaHostRegister refused at ") +
+                      std::to_string((p.refused_at) >> 20) + " MiB: " + cudaGetErrorString(e);
+            break;
+        }
+        pinned.push_back(block);
+    }
+    // Release everything, whatever happened above: a probe must not leave a registration alive for later measurements.
+    for (void* b : pinned) (void) cudaHostUnregister(b);
+    for (void* b : blocks) basalt::platform::free_aligned(b);
+    p.granted = (uint64_t) pinned.size() * slice_bytes;
+    p.slices = (uint32_t) pinned.size();
+    p.ok = true;   // a ceiling was found (or the limit was reached) even when the driver refused part way
+    if (p.refused_at == 0) p.error = "the probe's limit was reached before the driver refused";
+    return p;
+}
+
 /// The two one-time probes. Each runs on the first report and is cached, so a reprint does not touch the device or
 /// the drive again.
 struct H2dProbe {
@@ -335,6 +377,17 @@ basalt::platform::LargePageProbe large_page_probe_once() {
 }  // namespace
 
 void set_report_arena(PinnedArena* arena) { g_report_arena = arena; }
+
+HostRegisterProbe probe_host_register(uint64_t slice_bytes, uint64_t max_bytes) {
+    HostRegisterProbe p = probe_host_register_impl(slice_bytes, max_bytes);
+    // The two figures the engine compares the measurement against: the formula the sliced pin falls back to, and the
+    // DXGI shared budget it prefers. Both are what the sliced pin would use, so the probe says whether the answer
+    // makes either conservative.
+    const uint64_t ram = basalt::platform::total_physical_memory();
+    if (ram > 0) p.formula_bytes = ram / 2 > (8ull << 30) ? ram / 2 - (8ull << 30) : 0;
+    p.budget_bytes = basalt::platform::dxgi_non_local_budget(basalt::core::device_luid());   // 0 where nothing budgets it
+    return p;
+}
 
 void print_memory_report(const ReportFacts& facts) {
     std::fprintf(stderr, "basalt memory-report:\n");
@@ -497,6 +550,32 @@ void print_memory_report(const ReportFacts& facts) {
         arm(facts.reads_before);
         arm(facts.reads_after);
         arm(facts.reads_held_view);
+    }
+    // What cudaHostRegister accepts here, measured before the arena was created: the sliced pin's cap is a formula
+    // today, and this says whether the driver really allows that much.
+    if (facts.host_register.ok) {
+        const HostRegisterProbe& h = facts.host_register;
+        std::fprintf(stderr, "  probe host register: %u slices of %llu MiB accepted = %llu MiB%s\n", h.slices,
+                     (unsigned long long) (h.slice_bytes >> 20), (unsigned long long) (h.granted >> 20),
+                     h.refused_at > 0 ? " (the driver refused the next one)" : "");
+        if (h.refused_at > 0) std::fprintf(stderr, "  probe host register refusal: %s\n", h.error.c_str());
+        if (h.formula_bytes > 0 || h.budget_bytes > 0) {
+            // The margin matters more than the verdict: it is how much of the pinned ceiling the formula leaves unused.
+            const bool more = h.granted >= h.formula_bytes;
+            const uint64_t margin = more ? h.granted - h.formula_bytes : h.formula_bytes - h.granted;
+            if (h.formula_bytes == 0)
+                std::fprintf(stderr, "  probe host register vs the caps: the formula is not computable, DXGI shared "
+                                     "budget %llu MiB\n", (unsigned long long) (h.budget_bytes >> 20));
+            else
+                std::fprintf(stderr, "  probe host register vs the caps: the driver allows %llu MiB %s the RAM/2-8GiB "
+                                     "formula (%llu MiB), and the DXGI shared budget is %llu MiB\n",
+                             (unsigned long long) (margin >> 20), more ? "more than" : "less than",
+                             (unsigned long long) (h.formula_bytes >> 20),
+                             (unsigned long long) (h.budget_bytes >> 20));
+        }
+    } else {
+        std::fprintf(stderr, "  probe host register: not measured%s%s\n",
+                     facts.host_register.error.empty() ? "" : ": ", facts.host_register.error.c_str());
     }
     // What the OS prefetch hint buys on a mapped view: the cost of faulting a window with and without it, and with
     // time for the hint to land. A rate near memory speed says the pages were cached, not read from the drive.
