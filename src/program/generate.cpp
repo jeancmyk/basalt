@@ -1051,6 +1051,10 @@ bool checkpoint_save(ConvCheckpoint& c, const basalt::core::SessionState& ss, co
 bool checkpoint_restore(const ConvCheckpoint& c, basalt::core::SessionState& ss, const basalt::core::ModelGeometry& g) {
     std::string error;
     const void* slot = c.gdn_slot >= 0 ? g_gdn_slots.ptr(c.gdn_slot) : nullptr;
+    if (basalt::core::diagnostics().profile) {   // which copy the state comes from: a slot is D2D, else host bytes
+        const std::string where = c.gdn_slot >= 0 ? "slot " + std::to_string(c.gdn_slot) + " (D2D)" : "host bytes";
+        std::fprintf(stderr, "basalt serve: checkpoint restore at %lld: %s\n", (long long) c.ids.size(), where.c_str());
+    }
     if (basalt::core::conversation_checkpoint_restore(c, ss, g, error, slot)) return true;
     std::fprintf(stderr, "basalt serve: checkpoint restore: %s\n", error.c_str());
     return false;
@@ -5334,6 +5338,11 @@ int main(int argc, char** argv) {
                 } else if (defer && stages.empty()) {
                     if (!ckd.save(c, *rsp, g, ce)) { std::fprintf(stderr, "basalt serve: checkpoint save: %s\n", ce.c_str()); return false; }
                 } else if (!checkpoint_save(c, *rsp, g)) return false;
+                if (basalt::core::diagnostics().profile) {   // which copy the state went to: a slot is D2D, else host bytes
+                    const std::string where =
+                            c.gdn_slot >= 0 ? "slot " + std::to_string(c.gdn_slot) + " (D2D)" : "host bytes";
+                    std::fprintf(stderr, "basalt serve: checkpoint save at %lld: %s\n", (long long) L, where.c_str());
+                }
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const basalt::core::OnDevice on(st->dev);
                     ConvCheckpoint part;
