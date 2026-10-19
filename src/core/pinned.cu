@@ -577,6 +577,27 @@ void print_memory_report(const ReportFacts& facts) {
         std::fprintf(stderr, "  probe host register: not measured%s%s\n",
                      facts.host_register.error.empty() ? "" : ": ", facts.host_register.error.c_str());
     }
+    // What the token says about the large-page privilege, and what the two documented allocation forms do with it.
+    // A 1314 refusal has to be read against all of it: absent from the token, present but refused by the allocation,
+    // and a filtered token are three different problems.
+    {
+        const basalt::platform::LargePagePrivilege lp = basalt::platform::probe_large_page_privilege();
+        if (lp.ok) {
+            std::fprintf(stderr, "  large-page privilege: looked up %s, present %s, enabled %s; token elevated %s, "
+                                 "integrity 0x%llx, Administrators %s%s\n",
+                         lp.looked_up ? "yes" : "no", lp.present ? "yes" : "no", lp.enabled ? "yes" : "no",
+                         lp.elevated ? "yes" : "no", (unsigned long long) lp.integrity_rid,
+                         lp.admin_group ? "present" : "absent",
+                         lp.admin_deny_only ? " (deny-only: a filtered token)" : "");
+            std::fprintf(stderr, "  large-page privilege allocations: one page reserve+commit %s (error %llu), reserve "
+                                 "%s (error %llu), then commit large %s (error %llu)\n",
+                         lp.single_ok ? "succeeded" : "FAILED", (unsigned long long) lp.single_error,
+                         lp.reserve_ok ? "succeeded" : "FAILED", (unsigned long long) lp.reserve_error,
+                         lp.commit_ok ? "succeeded" : "FAILED", (unsigned long long) lp.commit_error);
+        } else {
+            std::fprintf(stderr, "  large-page privilege: not read%s%s\n", lp.note.empty() ? "" : ": ", lp.note.c_str());
+        }
+    }
     // What the OS prefetch hint buys on a mapped view: the cost of faulting a window with and without it, and with
     // time for the hint to land. A rate near memory speed says the pages were cached, not read from the drive.
     if (facts.view_faults.ok) {
