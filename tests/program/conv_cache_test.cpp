@@ -81,6 +81,37 @@ int main() {
         check(keep({10, 11, 12}, 2, 4) == 2, "a cap reached inside the window keeps up to its row");
         check(keep({248046, 11, 12}, 0, 100, 0) == 3, "the scoring path ignores stop tokens and commits every row");
         check(keep({10, 11}, 0, 1) == 1, "a cap of one token keeps the first row only");
+        // The batch path calls this function now, so it must reproduce what that loop computed on its own: walk every
+        // accepted width, every stop position and every cap, and compare against the loop's arithmetic written out.
+        const auto batch_loop = [&](const std::vector<int32_t>& picks, int64_t produced, int64_t max_new) {
+            int k = (int) picks.size();
+            for (int e = 0; e < k; ++e) {
+                const bool eos = picks[(size_t) e] == 248044 || picks[(size_t) e] == 248046;
+                const bool fin = eos || produced + e + 1 >= max_new;
+                if (fin) { k = e + 1; break; }
+            }
+            return k;
+        };
+        int compared = 0;
+        for (int accepted = 1; accepted <= 8; ++accepted) {
+            for (int stop_at = -1; stop_at < accepted; ++stop_at) {   // -1: no stop token in the window
+                for (int64_t produced = 0; produced <= 3; ++produced) {
+                    for (int64_t max_new = 1; max_new <= 12; ++max_new) {
+                        std::vector<int32_t> picks((size_t) accepted, 10);
+                        if (stop_at >= 0) picks[(size_t) stop_at] = 248046;
+                        const int shared = reply_keep(picks.data(), accepted, stops.data(), stops.size(), produced, max_new);
+                        const int own = batch_loop(picks, produced, max_new);
+                        if (shared != own) {
+                            std::printf("  reply_keep(%d, stop=%d, produced=%lld, max_new=%lld) = %d, batch loop = %d\n",
+                                        accepted, stop_at, (long long) produced, (long long) max_new, shared, own);
+                        }
+                        check(shared == own, "the shared rule reproduces the batch loop's committed count");
+                        ++compared;
+                    }
+                }
+            }
+        }
+        check(compared == 44 * 4 * 12, "the table covered every accepted width, stop position and cap");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

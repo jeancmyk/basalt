@@ -7962,9 +7962,13 @@ int main(int argc, char** argv) {
             };
             for (int sg = 0; sg < S; ++sg) {
                 const BSlot& sl = bs[(size_t) rows[sg]];
-                int k = 1;
-                while (k < lens[sg] && outb[r0s[sg] + k - 1] == drafts[sg][(size_t) k - 1]) ++k;
-                for (int e = 0; e < k; ++e) {
+                int accepted = 1;
+                while (accepted < lens[sg] && outb[r0s[sg] + accepted - 1] == drafts[sg][(size_t) accepted - 1]) ++accepted;
+                // The stop-token and token-cap rules are the serve path's, shared so the two cannot drift: both commit
+                // `e + 1` rows, and the stop token is the pick at row `e + 1`, never a committed row.
+                int k = basalt::program::conv_cache::reply_keep(outb + r0s[sg], accepted, o.eos_ids.data(),
+                                                               o.eos_ids.size(), sl.produced, sl.max_new);
+                for (int e = 0; e < k; ++e) {   // the batch's own conditions come from the same helper the serve path uses
                     fin_of[sg] = fin_at(sl, rows[sg], outb[r0s[sg] + e], e);
                     if (fin_of[sg] != nullptr) { k = e + 1; break; }
                 }
