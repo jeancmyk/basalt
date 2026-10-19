@@ -7522,7 +7522,7 @@ int main(int argc, char** argv) {
             {
                 const int64_t ctx = admit_slot >= 0 ? slot_cap[(size_t) admit_slot] : o.max_context;
                 const long long want = admit_slot >= 0 ? admit_max_new : (long long) max_new;   // a slot's request: its own max_new
-                if (n + want + 8 > ctx) {
+                if (!basalt::program::conv_cache::context_admits(n, want, ctx)) {
                     if (admit_slot >= 0)
                         std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds slot %d's context (%lld)\n", (long long) n,
                                     want, admit_slot, (long long) ctx);
@@ -8091,7 +8091,8 @@ int main(int argc, char** argv) {
             // way afterwards (more than a chunk and a short read left), text only, and the slot is not decoding
             auto can_yield = [&](int64_t q, int64_t b0, int ys) -> bool {
                 return ys >= 0 && ys < (int) bs.size() && !bs[(size_t) ys].active &&
-                       n + (admit_slot >= 0 ? admit_max_new : (long long) max_new) + 8 <= slot_cap[(size_t) ys] &&
+                       basalt::program::conv_cache::context_admits(
+                               n, admit_slot >= 0 ? admit_max_new : (long long) max_new, slot_cap[(size_t) ys]) &&
                        (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
                        (!in_slot || ys == slot_b) && b0 - q > std::max<int64_t>(std::max<int64_t>(sp.chunk(), 1), o.short_read);
             };
