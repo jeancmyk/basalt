@@ -40,4 +40,20 @@ inline size_t eviction_victim(const uint64_t* stamps, size_t n, int64_t cap) {
     return v;
 }
 
+/// How many of a verify window's accepted tokens the running state keeps.  The state ends where the reply ends: a
+/// stop token is not part of it - the next request's prompt renders that token again, and whether it does is the
+/// client's choice - and the accepted tokens after the stop were never emitted.  A reply that reaches its own token
+/// cap keeps the token that reached it.  `picks` are the window's accepted outputs, `produced` the tokens the reply
+/// held before the window, `max_new` its cap.  Returns 0 when the window's first pick stops: nothing to advance.
+/// `n_stops == 0` ignores stops (the scoring path commits every row).  Pure, so conv_cache_test.cpp walks the cases.
+inline int reply_keep(const int32_t* picks, int accepted, const int64_t* stops, size_t n_stops, int64_t produced,
+                      int64_t max_new) {
+    for (int i = 0; i < accepted; ++i) {
+        for (size_t s = 0; s < n_stops; ++s)
+            if ((int64_t) picks[i] == stops[s]) return i;
+        if (produced + i + 1 >= max_new) return i + 1;
+    }
+    return accepted;
+}
+
 }  // namespace basalt::program::conv_cache

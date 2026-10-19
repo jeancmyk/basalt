@@ -8545,6 +8545,10 @@ int main(int argc, char** argv) {
                 }
                 if (logit_hash)   // the accepted rows' logits, per position (equality of the batch rows with these)
                     for (int t = 0; t <= a; ++t) std::fprintf(stderr, "LH -1 %lld %016llx\n", (long long) (p + t), (unsigned long long) row_hash(t));
+                // The state ends where the reply ends: a stop token and the accepted tokens after it are not part of
+                // it, so the commit and `live` are one frontier.  (The scoring path commits every row.)
+                const int n_keep = basalt::program::conv_cache::reply_keep(
+                        outv.data(), a + 1, o.eos_ids.data(), ppl == nullptr ? o.eos_ids.size() : 0, produced_n, max_new);
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (tk_log != nullptr && tk_valid && !from_sfx && ppl == nullptr && req_temperature > 0.0) {
                     std::vector<float> lg((size_t) n_vocab);
@@ -8655,11 +8659,11 @@ int main(int argc, char** argv) {
                         }
                     };
                     basalt::core::decode_events().stamp(9);
-                    if (!ver.commit(a + 1, err, 2)) {
+                    if (n_keep > 0 && !ver.commit(n_keep, err, 2)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
                     }
-                    for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+                    for (int i = 0; i < n_keep; ++i) consumed.push_back(window[(size_t) i]);
                     draft_offered += T - 1;
                     draft_accepted += a;
                     first_window = false;
@@ -8667,7 +8671,7 @@ int main(int argc, char** argv) {
                     std::string cerr;
                     auto after_launch = [&] {
                         after_ran = true;
-                        commit_ok = ver.commit(a + 1, cerr, 1);
+                        commit_ok = n_keep == 0 || ver.commit(n_keep, cerr, 1);
                         adapt_side();
                         for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                             std::printf("T %d\n", (int) outv[(size_t) i]);
@@ -8737,13 +8741,13 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 spawn_adapt();
-                if (!ver.commit(a + 1, err)) {
+                if (n_keep > 0 && !ver.commit(n_keep, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
-                for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+                // the window's first n_keep tokens are in the session now (the last output is not: it is next x)
+                for (int i = 0; i < n_keep; ++i) consumed.push_back(window[(size_t) i]);
                 draft_offered += T - 1;
                 draft_accepted += a;
                 first_window = false;
