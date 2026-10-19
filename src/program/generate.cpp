@@ -8611,7 +8611,7 @@ int main(int argc, char** argv) {
                         }
                     };
                     basalt::core::decode_events().stamp(9);
-                    if (n_keep > 0 && !ver.commit(n_keep, err, 2)) {
+                    if (!ver.commit(n_keep, err, 2)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
                     }
@@ -8623,7 +8623,7 @@ int main(int argc, char** argv) {
                     std::string cerr;
                     auto after_launch = [&] {
                         after_ran = true;
-                        commit_ok = n_keep == 0 || ver.commit(n_keep, cerr, 1);
+                        commit_ok = ver.commit(n_keep, cerr, 1);
                         adapt_side();
                         for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                             std::printf("T %d\n", (int) outv[(size_t) i]);
@@ -8695,7 +8695,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 spawn_adapt();
-                if (n_keep > 0 && !ver.commit(n_keep, err)) {
+                if (!ver.commit(n_keep, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
