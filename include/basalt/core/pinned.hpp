@@ -100,6 +100,22 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
 /// Record the arena the memory report describes (may be null).  Called where the arena is created.
 void set_report_arena(PinnedArena* arena);
 
+/// What cudaHostRegister accepts on this machine, found by registering slices until the driver refuses one.
+struct HostRegisterProbe {
+    bool ok = false;
+    uint64_t slice_bytes = 0;     ///< the size of each registration attempted
+    uint64_t granted = 0;         ///< bytes the driver accepted before refusing
+    uint32_t slices = 0;          ///< how many of them that was
+    uint64_t refused_at = 0;      ///< the cumulative size at which it refused (0: nothing was refused)
+    std::string error;            ///< why it stopped, or why the probe could not run
+    uint64_t formula_bytes = 0;   ///< the cap the engine uses today (RAM/2 - 8 GiB), for comparison
+    uint64_t budget_bytes = 0;    ///< the DXGI shared budget the sliced pin uses, when known
+};
+/// Register `slice`-sized pieces of ordinary host memory until the driver refuses, then release every piece it
+/// accepted: the answer is what this machine's driver really allows, not what a formula assumes.  It must run before
+/// the expert arena is created, so the arena's own pinning does not count against the ceiling.  Nothing stays pinned.
+HostRegisterProbe probe_host_register(uint64_t slice_bytes, uint64_t max_bytes);
+
 /// What only the caller knows: the VRAM tier it planned and the read rates it measured. The report cannot query
 /// either, so a fact the caller does not have prints as unknown rather than as a zero that reads like a measurement.
 struct ReportFacts {
@@ -120,6 +136,7 @@ struct ReportFacts {
     ReadArm reads_after;                       ///< measured with whatever this run maps
     ReadArm reads_held_view;                   ///< measured with a view the probe holds itself, for the comparison
     basalt::platform::ViewFaultProbe view_faults;   ///< what faulting a view costs, with and without the hint
+    HostRegisterProbe host_register;           ///< what cudaHostRegister really accepts, measured before the arena
 };
 
 /// Print the consolidated memory report to stderr: host RAM and commit headroom, the process, the arena, the VRAM
