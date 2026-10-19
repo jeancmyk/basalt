@@ -58,4 +58,13 @@ inline int reply_keep(const int32_t* picks, int accepted, const int64_t* stops, 
     return accepted;
 }
 
+/// Whether a request's prompt and its generation budget fit the context it will run in.  `kAdmitSlack` tokens are held
+/// back past the prompt and the budget (the last prompt token starts a window, and a window of drafts runs ahead of
+/// it), so the test is `n + want + slack > ctx` and a request EXACTLY at `ctx` is admitted - the boundary is the first
+/// count past it, not `ctx` itself.  Pure, so conv_cache_test.cpp covers the boundary rather than the middle.
+inline constexpr int64_t kAdmitSlack = 8;
+inline bool context_admits(int64_t prompt, int64_t want, int64_t ctx) {
+    return prompt + want + kAdmitSlack <= ctx;
+}
+
 }  // namespace basalt::program::conv_cache
