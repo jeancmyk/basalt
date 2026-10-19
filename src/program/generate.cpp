@@ -778,7 +778,8 @@ void usage() {
                  "  --profile            GPU stage times of the decode windows (serve path)\n"
                  "  --wait-stats         the host's wait times in the decode loop (serve path)\n"
                  "  --decode-timing      one line per request: where its decode time went (serve path)\n"
-                 "  --memory-report      print the consolidated memory/VRAM/IO report at startup (diagnostic)\n"
+                 "  --memory-report      print the consolidated memory/VRAM/IO report at startup, and again on the\n"
+                 "                       MEMREPORT command (diagnostic)\n"
                  "  --draft-log FILE     one line per decode window for draft-policy study\n"
                  "  --ppl-base FILE      llama.cpp KL-divergence base for ppl= requests\n"
                  "  --ppl-out FILE       where ppl= requests write their per-row lines\n"
@@ -7199,6 +7200,16 @@ int main(int argc, char** argv) {
                 if (batch_on()) verr = "VRAM: not while batch slots are decoding";
                 else vram_command(line, verr);
                 if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            if (line.rfind("MEMREPORT", 0) == 0) {   // the same report, on demand, between requests
+                if (!basalt::core::diagnostics().memory_report) {
+                    std::printf("ERR MEMREPORT needs --memory-report\n");
+                } else {
+                    mem_report();   // the probes are cached, so this measures nothing again
+                    std::printf("MEMREPORT ok\n");
+                }
                 std::fflush(stdout);
                 continue;
             }
