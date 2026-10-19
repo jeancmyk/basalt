@@ -20,6 +20,8 @@
 #include <vector>
 
 using basalt::program::conv_cache::eviction_victim;
+using basalt::program::conv_cache::context_admits;
+using basalt::program::conv_cache::kAdmitSlack;
 using basalt::program::conv_cache::reply_keep;
 
 namespace {
@@ -112,6 +114,24 @@ int main() {
             }
         }
         check(compared == 44 * 4 * 12, "the table covered every accepted width, stop position and cap");
+    }
+    {
+        // Acceptance boundaries: exactly at ctx is admitted, the first count past it is not. A test that only checked
+        // the middle would not catch a `>=` regression, so the exact points are the ones asserted.
+        check(context_admits(8, 0, 16), "prompt + slack exactly at the context is admitted");
+        check(!context_admits(9, 0, 16), "one token past the context is refused");
+        check(context_admits(0, 8, 16), "an empty prompt with the budget exactly at the context is admitted");
+        check(!context_admits(0, 9, 16), "a budget one past the context is refused");
+        check(context_admits(4, 4, 16), "prompt and budget sharing the slack are admitted at the boundary");
+        check(!context_admits(4, 5, 16), "one over that shared boundary is refused");
+        check(kAdmitSlack == 8, "the reserved slack is the eight tokens the call sites used inline");
+        check(context_admits(0, 0, kAdmitSlack), "an empty prompt with no budget fits the slack");
+        check(!context_admits(0, 0, kAdmitSlack - 1), "a context smaller than the slack admits nothing");
+        check(!context_admits(-1, 100, 16), "a negative prompt cannot slip past the boundary");
+        for (int64_t ctx = kAdmitSlack; ctx < 40; ++ctx) {   // the exact point, for every context in a small range
+            check(context_admits(ctx - kAdmitSlack, 0, ctx) && !context_admits(ctx - kAdmitSlack + 1, 0, ctx),
+                  "the boundary is the first count past the context, for every context in the range");
+        }
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
