@@ -241,6 +241,31 @@ uint64_t dxgi_non_local_budget(const void* luid);
 /// token could not be adjusted, which the callers report and fall back from.
 bool enable_lock_memory_privilege();
 
+/// What this process's token says about the large-page privilege, and what the two documented allocation forms do
+/// with it. A refusal of 1314 (ERROR_PRIVILEGE_NOT_HELD) has to be read against all of it: a privilege absent from
+/// the token is a policy problem, one present and enabled but still refused is a different problem, and a filtered
+/// token (Administrators deny-only at Medium integrity) is the ordinary interactive case.
+struct LargePagePrivilege {
+    bool ok = false;              ///< the token could be read at all
+    bool looked_up = false;       ///< LookupPrivilegeValue found SeLockMemoryPrivilege
+    bool present = false;         ///< the token carries it
+    bool enabled = false;         ///< and it is enabled
+    bool elevated = false;        ///< TokenElevation
+    uint64_t integrity_rid = 0;   ///< TokenIntegrityLevel: 0x1000 medium, 0x2000 high, 0x3000 system
+    bool admin_group = false;     ///< BUILTIN\Administrators is in the token
+    bool admin_deny_only = false; ///< ... and only as deny-only, which is a UAC-filtered token
+    bool single_ok = false;       ///< RESERVE|COMMIT|LARGE_PAGES in one call, one large page
+    uint64_t single_error = 0;
+    bool reserve_ok = false;      ///< MEM_RESERVE alone, one large page
+    uint64_t reserve_error = 0;
+    bool commit_ok = false;       ///< MEM_COMMIT|MEM_LARGE_PAGES into that reservation
+    uint64_t commit_error = 0;
+    std::string note;             ///< why the probe could not run, when it could not
+};
+/// Read the token state and try the two allocation forms. Nothing is left allocated or adjusted: every region it
+/// gets is released before the return. On a platform without this privilege the result says so and nothing is tried.
+LargePagePrivilege probe_large_page_privilege();
+
 /// How much of a large-page request the system's pool actually grants.
 struct LargePageProbe {
     uint64_t minimum = 0;    ///< GetLargePageMinimum(): 0 when this system has no large pages at all

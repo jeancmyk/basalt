@@ -59,6 +59,17 @@ process code page UTF-8 and lifts the path length limit.
   is created: a process started from a session that already exists cannot acquire a right assigned
   afterwards, and the enable call reports `ERROR_NOT_ALL_ASSIGNED` (1300). A 1300 in the start-up
   note means the grant has not taken effect yet, not that it was never made.
+  Being granted is not the same as being *effective*, and for the large-page arena the
+  difference is a **UAC elevation**. An assigned and enabled `SeLockMemoryPrivilege` in a
+  Medium-integrity, UAC-filtered token still answers `ERROR_PRIVILEGE_NOT_HELD` (1314) to every
+  `VirtualAlloc` form; the same binary started from an elevated console (high integrity,
+  `0x3000`, Administrators present and not deny-only) gets large pages for the whole arena. So a
+  1314 at start-up is the signature of the token rather than of the code, and the note's number is
+  the tell - a missing effective privilege (1314), a declined large-page pool (1450) and a size
+  that is not a multiple of the minimum (87) need different fixes and look alike otherwise. The
+  memory report reads the token state back (`present`, `enabled`, elevation, integrity, whether
+  Administrators is deny-only) and tries each allocation form, so one line settles what four
+  guesses could not.
   The large-page request is made in **1 GiB chunks into one reservation**, not as a single
   all-or-nothing call, so a pool that is merely smaller than the arena can be told apart from one
   that is absent. The arena has to stay one contiguous range - layer bounds index into it, the
