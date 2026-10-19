@@ -3139,9 +3139,7 @@ int main(int argc, char** argv) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         plan_free_device = free_b;
-        // --exp dxgi-unavailable=1 pretends the budget query failed, so the path where nothing is clamped can be
-        // exercised on a machine where the budget query always answers. A short-lived gate, not a setting.
-        if (basalt::core::exp_flag("dxgi-unavailable", 0.0) <= 0.0) {
+        {
             // The query names the adapter of the device being planned for.  Where the OS budgets no video memory
             // the answer is not-ok and the free figure stands alone, which is what those platforms need rather
             // than a zero read as a limit.
@@ -3478,11 +3476,6 @@ int main(int argc, char** argv) {
                 cudaMemGetInfo(&free_b, &total_b);   // a second reading, so a settling allocation is not read as a spill
                 spill_seen = (int64_t) basalt::platform::spill_shortfall(free_before, free_b, (uint64_t) xcache.bytes(), kSpillTolerance);
             }
-            // --exp spill-force-mib=N pretends N MiB of the tier went to system memory, so the hand-back path can be
-            // exercised on a machine where nothing spills. A short-lived gate: it goes when the guard is trusted.
-            const double forced_spill_mib = basalt::core::exp_flag("spill-force-mib", 0.0);
-            if (forced_spill_mib > 0.0)
-                spill_seen = std::max<int64_t>(spill_seen, (int64_t) (forced_spill_mib * 1048576.0));
             const int64_t want = (int64_t) o.vram_reserve_mib << 20;
             const bool reserve_short = (int64_t) free_b < want - (64ll << 20);
             if (!reserve_short && spill_seen == 0) break;
