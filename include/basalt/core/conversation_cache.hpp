@@ -208,8 +208,16 @@ struct SavedConversation {
     }
 };
 
-/// Element-by-element token equality, any token width.  Every caller only asks "equal or not", so this is the shape
-/// the bulk path below has to agree with.
+/// Cells of the draft layer a token-prefix key of `tokens` tokens names.  The drafter's cell i pairs the main
+/// model's residual at position i with the token at i + 1, so its key is a bigram sequence: N tokens are N - 1
+/// bigrams, and a key of N tokens names cells [0, N - 1).  Cell N - 1 pairs with the token at N, which the key does
+/// not contain: it belongs to the next slice and shares this slice's boundary token.  Cached draft-path K/V is keyed
+/// by this count, never by the token count, and the cells it does not name are saved zeroed, so no reuse reads a
+/// pair from another turn.
+inline int64_t draft_cells(int64_t tokens) { return tokens > 0 ? tokens - 1 : 0; }
+
+/// Element-by-element token equality, any token width.  Every caller only asks "equal or not", so this is
+/// the shape the bulk path below has to agree with.
 template<class Token>
 bool conversation_ids_equal_linear(const int32_t* ids, size_t n, const Token* prompt) {
     for (size_t i = 0; i < n; ++i)
