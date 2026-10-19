@@ -40,11 +40,16 @@ process code page UTF-8 and lifts the path length limit.
 
 - One GPU. The peer and multi-GPU flags stop the engine at start-up.
 - Pinned memory is capped by the driver under WDDM. When the whole arena cannot be registered,
-  the pinned slices are limited to the GPU's shared-memory budget (`RAM/2 - 8 GiB`), and the
-  start-up note says what was capped.
+  the pinned slices are limited to the GPU's shared-memory budget: the adapter's DXGI non-local
+  budget less 8 GiB of headroom where DXGI answers, and `RAM/2 - 8 GiB` when it does not. The
+  start-up note says which one capped it and what was capped.
 - Large pages need the "Lock pages in memory" privilege, and locking the resident expert copy
   needs "Increase a process working set". Grant both under Local Security Policy, User Rights
-  Assignment. Without them the engine falls back to 4 KiB pages and says so at start-up.
+  Assignment. Without them the engine falls back to 4 KiB pages and says so at start-up. A grant
+  takes effect at the **next logon**, because a token's privileges are snapshotted when its session
+  is created: a process started from a session that already exists cannot acquire a right assigned
+  afterwards, and the enable call reports `ERROR_NOT_ALL_ASSIGNED` (1300). A 1300 in the start-up
+  note means the grant has not taken effect yet, not that it was never made.
 - Shared arena files and cgroup quotas do not exist. The engine refuses the first and reports no
   container limit.
 - `basalt serve` runs the Python server as a child and exits with its status; Linux replaces
@@ -70,3 +75,14 @@ ctest --test-dir build -L cpu -j 8 --output-on-failure
 
 If tests fail to create fixtures, point `TEMP` and `TMP` at a directory inside the build tree.
 `cpu_quota_test` and `pool_affinity_test` exercise Linux-only surfaces and are not built.
+
+MSVC reports `__cplusplus` as `199711L` unless `/Zc:__cplusplus` is given, and `cuda.h` applies
+`alignas(TENSOR_MAP_ALIGN)` to `CUtensorMap` only when it reads a current value: without the flag
+the descriptor loses its alignment and every TMA copy through it faults. The build passes the flag
+to `cl.exe` and to nvcc's host pass, and `src/kernels/cuda/hc_fused.cu` asserts the boundary
+instead of trusting the header's spelling — `alignof(CUtensorMap) >= 64`, and the descriptors on a
+64-byte offset inside the launch argument struct, which hold for the 8-, 64- and 128-byte
+spellings alike and fail loudly if a toolkit or a new call site breaks them. CUDA 13.0 to 13.2
+spell that alignment as 128 while the MSVC ABI's rules for passing a type by value assume a 64-byte
+boundary, so a kernel that starts taking a descriptor **by value** needs CUDA 13.3 or later, where
+the headers settle, or the same header patch the Windows wheels of other engines apply.

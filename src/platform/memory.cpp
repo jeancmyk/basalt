@@ -12,6 +12,7 @@
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
 #include <malloc.h>   // _aligned_malloc, _aligned_free
+#include <dxgi1_4.h>  // IDXGIAdapter3::QueryVideoMemoryInfo
 #else
 #include <fcntl.h>
 #include <linux/mman.h>   // MAP_HUGE_2MB
@@ -169,6 +170,33 @@ uint64_t commit_headroom() {
     return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullAvailPageFile : 0;
 #else
     return available_memory();
+#endif
+}
+
+uint64_t commit_limit() {
+#if defined(_WIN32)
+    // RAM plus the page file: the pair a page-locked or fully reserved arena has to fit inside.
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullTotalPageFile : 0;
+#else
+    return total_physical_memory();
+#endif
+}
+
+bool working_set_quota(uint64_t& min_bytes, uint64_t& max_bytes) {
+#if defined(_WIN32)
+    SIZE_T min_ws = 0, max_ws = 0;
+    DWORD flags = 0;
+    if (!GetProcessWorkingSetSizeEx(GetCurrentProcess(), &min_ws, &max_ws, &flags)) return false;
+    min_bytes = (uint64_t) min_ws;
+    max_bytes = (uint64_t) max_ws;
+    return true;
+#else
+    // Linux sets no per-process working-set quota; the page-lock limit itself is what binds.
+    (void) min_bytes;
+    (void) max_bytes;
+    return false;
 #endif
 }
 
@@ -459,13 +487,32 @@ void free_region(void* p, uint64_t bytes) {
     VirtualFree(p, 0, MEM_RELEASE);
 }
 
-bool pin_budget(uint64_t& limit, std::string& why) {
+bool pin_budget(uint64_t& limit, std::string& why, const void* luid) {
     constexpr uint64_t GiB = 1ull << 30;
+    // Page-locked memory the GPU maps is charged to the device's shared (non-local) segment. Registering slice by
+    // slice until the driver refuses leaves that segment full and every later device allocation fails "out of
+    // memory", so the caller stops at the segment's budget instead, keeping room for what it allocates after.
+    constexpr uint64_t kHeadroom = 8ull * GiB;
+    char buf[192];
+    const uint64_t budget = dxgi_non_local_budget(luid);
+    if (budget != 0) {
+        if (budget > kHeadroom) {
+            limit = budget - kHeadroom;
+            std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget, %.1f GiB via DXGI (minus %.0f GiB headroom)",
+                          (double) budget / (double) GiB, (double) kHeadroom / (double) GiB);
+        } else {
+            limit = budget;
+            std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget, %.1f GiB via DXGI (no headroom taken)",
+                          (double) budget / (double) GiB);
+        }
+        why = buf;
+        return true;
+    }
+    // DXGI did not answer. The shared segment is about half of installed RAM, so the RAM reading bounds it.
     const uint64_t ram = basalt::platform::total_physical_memory();
     if (ram == 0) return false;
     limit = ram / 2 > 8 * GiB ? ram / 2 - 8 * GiB : 0;
-    char buf[192];
-    std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget, RAM/2 - 8 GiB of %.1f GiB RAM",
+    std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget, RAM/2 - 8 GiB of %.1f GiB RAM (DXGI unavailable)",
                   (double) ram / (double) GiB);
     why = buf;
     return true;
@@ -632,7 +679,7 @@ void free_region(void* p, uint64_t bytes) {
     munmap(p, bytes);
 }
 
-bool pin_budget(uint64_t&, std::string&) { return false; }   // no OS-side budget below the driver's own limit
+bool pin_budget(uint64_t&, std::string&, const void*) { return false; }   // no OS-side budget below the driver's own limit
 #endif
 
 void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
@@ -645,5 +692,82 @@ void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const 
     return p;
 }
 
+
+void print_dxgi_memory_report() {
+#if defined(_WIN32)
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**) &factory)) || !factory) {
+        std::fprintf(stderr, "  dxgi: CreateDXGIFactory1 failed\n");
+        return;
+    }
+    IDXGIAdapter1* adapter = nullptr;
+    if (SUCCEEDED(factory->EnumAdapters1(0, &adapter)) && adapter) {
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(adapter->GetDesc1(&desc)))
+            std::fprintf(stderr, "  dxgi adapter: %ls (vendor 0x%04x)\n", desc.Description, (unsigned) desc.VendorId);
+        IDXGIAdapter3* a3 = nullptr;
+        if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**) &a3)) && a3) {
+            for (int g = 0; g < 2; ++g) {
+                DXGI_MEMORY_SEGMENT_GROUP grp = (g == 0) ? DXGI_MEMORY_SEGMENT_GROUP_LOCAL : DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL;
+                DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+                if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, grp, &info)))
+                    std::fprintf(stderr, "  dxgi %s: budget %llu MiB, current usage %llu MiB, available %llu MiB, committed %llu MiB\n",
+                                 g == 0 ? "local" : "non-local",
+                                 (unsigned long long) (info.Budget >> 20), (unsigned long long) (info.CurrentUsage >> 20),
+                                 (unsigned long long) (info.AvailableForReservation >> 20), (unsigned long long) (info.CurrentReservation >> 20));
+            }
+            a3->Release();
+        }
+        // output count / display-attached
+        IDXGIOutput* out = nullptr;
+        UINT nout = 0;
+        while (adapter->EnumOutputs(nout, &out) == S_OK) { if (out) out->Release(); ++nout; }
+        std::fprintf(stderr, "  dxgi outputs: %u\n", nout);
+        adapter->Release();
+    }
+    factory->Release();
+#else
+    // no-op
+#endif
+}
+
+uint64_t dxgi_non_local_budget(const void* luid) {
+#if defined(_WIN32)
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**) &factory)) || !factory) return 0;
+    uint64_t budget = 0;
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; ++i) {
+        if (!adapter) continue;
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(adapter->GetDesc1(&desc))) {
+            bool match = true;
+            if (luid) {
+                LUID* pluid = (LUID*) luid;
+                match = (desc.AdapterLuid.LowPart == pluid->LowPart &&
+                         desc.AdapterLuid.HighPart == pluid->HighPart);
+            }
+            if (match) {
+                IDXGIAdapter3* a3 = nullptr;
+                if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**) &a3)) && a3) {
+                    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+                    if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info)))
+                        budget = (uint64_t) info.Budget;
+                    a3->Release();
+                }
+                adapter->Release();
+                break;
+            }
+        }
+        adapter->Release();
+        adapter = nullptr;
+    }
+    factory->Release();
+    return budget;
+#else
+    (void) luid;
+    return 0;
+#endif
+}
 
 }  // namespace basalt::platform

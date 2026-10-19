@@ -28,6 +28,7 @@ from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
 from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStuck
 from serve.engine.slots import AdmissionQueue
+from serve.engine import winjob
 from serve.engine.progress import narrate_start, start_errors, start_failure_hint, start_last_line
 
 
@@ -169,9 +170,11 @@ class ProcessEngine:
         sink = None if log else ProcessEngine.stderr_sink
         self.max_context = 0                            # before the new process is visible: never its predecessor's
         self.proc = subprocess.Popen([engine_bin, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE if sink else self.log, text=True, encoding="utf-8",
-                                     bufsize=1, env=env)
+                                      stderr=subprocess.PIPE if sink else self.log, text=True, encoding="utf-8",
+                                      bufsize=1, env=env,
+                                      creationflags=winjob.breakaway_flags())
         frame_pipes(self.proc, sink is not None)
+        winjob.contain(self.proc)
         if sink:
             threading.Thread(target=pump_lines, args=(self.proc.stderr, sink), daemon=True).start()
         # the lines come from a thread up to READY, so the read can time out and the rest of the stream stays for _pump
