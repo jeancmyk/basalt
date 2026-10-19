@@ -20,6 +20,7 @@
 #include <vector>
 
 using basalt::program::conv_cache::eviction_victim;
+using basalt::program::conv_cache::reply_keep;
 
 namespace {
 int g_fail = 0;
@@ -61,6 +62,24 @@ int main() {
         const size_t a = eviction_victim(stamps.data(), stamps.size(), 4);
         const size_t b = eviction_victim(stamps.data(), stamps.size(), 4);
         check(a == 1 && b == 1, "ties among equally stale leaves: the earlier index, deterministically");
+    }
+    {
+        // The state keeps the reply's own tokens: a stop token ends the reply and is not committed, the accepted
+        // tokens after it were never emitted, and a reply that reaches its cap keeps the token that reached it.
+        const std::vector<int64_t> stops = {248044, 248046};
+        const auto keep = [&](std::initializer_list<int32_t> picks, int64_t produced, int64_t max_new,
+                              size_t n_stops = 2) {
+            const std::vector<int32_t> p(picks);
+            return reply_keep(p.data(), (int) p.size(), stops.data(), n_stops, produced, max_new);
+        };
+        check(keep({10, 11, 12}, 0, 100) == 3, "a window with no stop token commits every accepted token");
+        check(keep({248046, 11, 12}, 0, 100) == 0, "the first pick stops: nothing to advance");
+        check(keep({10, 248044, 12, 13}, 0, 100) == 1, "the stop token and every accepted token after it are not kept");
+        check(keep({10, 11, 248046}, 0, 100) == 2, "a stop token as the last accepted token is not kept either");
+        check(keep({10, 11, 12}, 3, 4) == 1, "the token that reaches the cap is kept, the rest were not emitted");
+        check(keep({10, 11, 12}, 2, 4) == 2, "a cap reached inside the window keeps up to and including it");
+        check(keep({248046, 11, 12}, 0, 100, 0) == 3, "the scoring path ignores stop tokens and commits every row");
+        check(keep({10, 11}, 0, 1) == 1, "a cap of one token keeps the first pick only");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
