@@ -45,11 +45,16 @@ std::vector<Decision> replay(const std::vector<DraftLogWindow>& windows, int& sk
     std::vector<Decision> trace;
     skipped = 0;
     for (const DraftLogWindow& w : windows) {
-        if (w.from_sfx || !w.has_probs) { ++skipped; continue; }   // a lookup window: no match length in the log
-        const Choice ch = c.choose(0, 0, true);
+        // A lookup window is replayable only when the log carries the match length observe() needs; an old log's
+        // lookup windows (and any window with neither block nor match) are skipped and counted, never approximated.
+        if (w.from_sfx && !w.has_match()) { ++skipped; continue; }
+        if (!w.from_sfx && !w.has_probs) { ++skipped; continue; }
+        // The proposal the run had: a lookup window offered at least the width it used, from that match length; an MTP
+        // window offered no lookup at all.  Passing the match length here is what makes the appended field matter.
+        const Choice ch = w.from_sfx ? c.choose(w.T - 1, w.sfx_match, true) : c.choose(0, 0, true);
         trace.push_back({(int) ch.source, ch.k});
-        check(ch.source != Source::Lookup, "a replay without a lookup proposal never selects lookup");
-        c.observe(ch, w.accepted, 0);   // observe clamps to the choice's own width
+        if (!w.from_sfx) check(ch.source != Source::Lookup, "a replay without a lookup proposal never selects lookup");
+        c.observe(ch, w.accepted, w.has_match() ? w.sfx_match : 0);   // observe clamps to the choice's own width
     }
     return trace;
 }
@@ -59,7 +64,7 @@ int main() {
     {   // the reader: the two field counts, and a truncated or malformed line is skipped rather than fatal
         const std::string text =
                 "R temp=0 min_p=0 S=7\n"
-                "W 7 4 0 12.5 0.5 1.2 -1.0000 -1.0000 -1.0000 0.9 0.8 0.7 0.6 0.5 0.4 0.3 0.2 0.1 0.0 0.0 0.0 0.0 0.0\n"
+                "W 7 4 0 12.5 0.5 1.2 0.9 0.8 0.7 0.6 0.5 0.4 0.3\n"   // S=7, so seven floats, not sixteen
                 "W 7 0 1 12.5 0.5 0.0\n"                  // a lookup window: six values, no probability block
                 "W 7 9 0 1 1 1\n"                         // accepted past the window: malformed
                 "W 7\n"                                   // truncated
@@ -98,13 +103,53 @@ int main() {
                     name((Source) first.front().source), first.front().k, name((Source) first.back().source),
                     first.back().k);
     }
-    {   // a lookup window is SKIPPED, not approximated: the log has no match length to feed observe()
+    {   // shape 1, an OLD lookup window (no block, no field): skipped, because observe() has no match length to take
         const std::string text = "W 7 0 1 12.5 0.5 0.0\nW 7 3 1 12.5 0.5 0.0\nW 7 4 0 12.5 0.5 1.2 0.9 0.8 0.7 0.6 0.5 0.4 0.3 0.2 0.1 0.0 0.0 0.0 0.0 0.0 0.0 0.0\n";
         size_t skipped = 0;
         const std::vector<DraftLogWindow> w = draft_log_windows(text, &skipped);
         int replay_skipped = 0;
         const std::vector<Decision> trace = replay(w, replay_skipped);
-        check(replay_skipped == 2 && trace.size() == 1, "lookup windows are skipped and counted, never approximated");
+        check(replay_skipped == 2 && trace.size() == 1, "old lookup windows are skipped and counted, never approximated");
+        check(!w[0].has_match() && !w[1].has_match(), "a log written before the field reports no match length");
+        check(!w[0].has_probs && !w[1].has_probs && w[2].has_probs, "the block still discriminates the two old shapes");
+    }
+    {   // the FOUR SHAPES, and the field's two meanings: a length for a lookup window, an explicit -1 for an MTP one
+        const std::string probs = "0.9 0.8 0.7 0.6 0.5 0.4 0.3 0.2 0.1 0.0 0.0 0.0 0.0 0.0 0.0 0.0";
+        size_t bad = 0;
+        const auto old_lookup = draft_log_windows("W 7 3 1 12.5 0.5 0.0\n", &bad);
+        check(bad == 0 && old_lookup.size() == 1 && !old_lookup[0].has_probs && !old_lookup[0].has_match(),
+              "shape 1, old lookup: no block, no match length");
+        const auto new_lookup = draft_log_windows("W 7 3 1 12.5 0.5 0.0 20\n", &bad);
+        check(bad == 0 && new_lookup.size() == 1 && !new_lookup[0].has_probs && new_lookup[0].sfx_match == 20,
+              "shape 2, new lookup: the appended match length, still no block");
+        const auto old_mtp = draft_log_windows("W 7 3 0 12.5 0.5 1.2 " + probs + "\n", &bad);
+        check(bad == 0 && old_mtp.size() == 1 && old_mtp[0].has_probs && !old_mtp[0].has_match(),
+              "shape 3, old MTP: the block, no field");
+        const auto new_mtp = draft_log_windows("W 7 3 0 12.5 0.5 1.2 " + probs + " -1\n", &bad);
+        check(bad == 0 && new_mtp.size() == 1 && new_mtp[0].has_probs && !new_mtp[0].has_match(),
+              "shape 4, new MTP: the writer's explicit -1 means 'no match length', not 'field missing'");
+        const auto short_block = draft_log_windows("W 7 3 0 1.0 0.5 0.2 0.9 0.8 0.7\n", &bad);
+        check(bad == 0 && short_block.size() == 1 && short_block[0].has_probs,
+              "a partial block is legal: the writer emits min(S_mtp, 16) floats, not a fixed 16");
+        const auto short_with_match = draft_log_windows("W 7 3 1 1.0 0.5 0.2 0.9 0.8 0.7 11\n", &bad);
+        check(bad == 0 && short_with_match.size() == 1 && short_with_match[0].has_probs
+                  && short_with_match[0].sfx_match == 11,
+              "a short block followed by the match length parses");
+        check(draft_log_windows("W 7 3 0 1.0 0.5 0.2 " + probs + " 12x\n", &bad).empty() && bad == 1,
+              "unknown text after the match length is malformed, not silently truncated");
+        // The field must MATTER to a replay, not just to a bucket lookup: two lookup-only logs with the same acceptance,
+        // one long match and one trigram.  If replay() ignored sfx_match, the two traces would be identical.
+        const auto long_log = draft_log_windows("W 7 3 1 12.5 0.5 0.0 20\nW 7 3 1 12.5 0.5 0.0 20\nW 7 3 1 12.5 0.5 0.0 20\n", &bad);
+        const auto short_log = draft_log_windows("W 7 3 1 12.5 0.5 0.0 3\nW 7 3 1 12.5 0.5 0.0 3\nW 7 3 1 12.5 0.5 0.0 3\n", &bad);
+        check(long_log.size() == 3 && short_log.size() == 3, "both lookup-only logs parse");
+        int skipped_long = 0, skipped_short = 0;
+        const std::vector<Decision> long_trace = replay(long_log, skipped_long);
+        const std::vector<Decision> short_trace = replay(short_log, skipped_short);
+        check(skipped_long == 0 && skipped_short == 0, "a new-format lookup window is replayed, not skipped");
+        check(long_trace.size() == 3 && short_trace.size() == 3, "every window of both logs is replayed");
+        check(long_trace != short_trace, "the replayed match length changes the decisions a replay reaches");
+        std::printf("field: match 20 -> %s k=%d, match 3 -> %s k=%d\n", name((Source) long_trace[0].source),
+                    long_trace[0].k, name((Source) short_trace[0].source), short_trace[0].k);
     }
     // REMOVED, and it was a finding rather than a missing test: under a FIXED accepted count the controller's choice
     // never settles (measured: k changed on ~80% of windows forever, around k = level + 1).  The cause is in the

@@ -8716,7 +8716,10 @@ int main(int argc, char** argv) {
                             std::fprintf(draft_log, "W %d %d %d %.3f %.3f %.3f", T, a, from_sfx ? 1 : 0, msd(round0, tw0),
                                          msd(tw0, tw1), msd(tw1, tw3));
                             for (int i = 0; i < wprob_n; ++i) std::fprintf(draft_log, " %.4f", wprob[i]);
-                            std::fputc('\n', draft_log);
+                            // Appended after the probability block, never before it: the block's presence is what
+                            // distinguishes the two line shapes, so a field in front of it would change every parse.
+                            // A lookup window carries the match length its observe() needs; an MTP window has none.
+                            std::fprintf(draft_log, " %d\n", from_sfx ? sfx_match : -1);
                         }
                     }
                     if (adapt_thr.joinable()) adapt_thr.join();
