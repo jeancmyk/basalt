@@ -3253,6 +3253,20 @@ int main(int argc, char** argv) {
         report_reads_before.shallow = basalt::platform::probe_reads(o.model, 4096, 32, 512);
         report_reads_before.deep = basalt::platform::probe_reads(o.model, 4096, 256, 512);
     }
+    // WHAT THE DRIVER REALLY PINS, AND IT MUST BE ASKED NOW.  The sliced pin's cap is a formula today, and the only
+    // way to say whether the formula is conservative is to register until the driver refuses - which can only be
+    // measured before the expert arena takes its own registrations, since those count against the same ceiling.  The
+    // probe releases every piece it accepts, so nothing is left pinned for the run or for a later measurement.
+    // It is a heavy diagnostic - it touches as much host memory as it registers - so it runs only with
+    // --memory-report, like every other probe, and a normal start never reaches it.
+    basalt::core::HostRegisterProbe report_host_register;
+    if (basalt::core::diagnostics().memory_report) {
+        // RAM/2 is where the sliced pin's formula lives, and the driver's refusal lands near it, so the walk has to
+        // reach it or the answer is only a lower bound. It touches as much host memory as it registers: that is the
+        // cost of a real ceiling rather than a formula, and it is paid only under --memory-report.
+        const uint64_t ram = basalt::platform::total_physical_memory();
+        report_host_register = basalt::core::probe_host_register(1ull << 30, ram > 0 ? ram / 2 : (32ull << 30));
+    }
     basalt::core::ArenaExpertSource arena_src;
     basalt::core::ExpertSource* srcp = nullptr;
     if (o.mmap_experts) {
@@ -3743,6 +3757,7 @@ int main(int argc, char** argv) {
         }
         report_facts.reads_after = report_reads_after;
         report_facts.reads_held_view = report_reads_held_view;
+        report_facts.host_register = report_host_register;
         if (!report_view_faults_done) {
             // What the prefetch hint buys when a view is faulted: windows over parts of the file that were never read
             // through a view, three arms rotated through each round so none is always the colder one.  The third arm
