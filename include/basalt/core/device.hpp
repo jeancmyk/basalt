@@ -38,6 +38,12 @@ int device_count();
 // the runtime cannot describe it.
 bool device_summary(int ordinal, std::string& name, std::string& detail);
 
+// The current device's OS adapter id, as the 8 bytes the OS matches its own per-adapter figures by.  It lets a
+// caller ask the OS about the card its device allocations land on rather than about whichever adapter the OS
+// happens to list first.  nullptr when the driver has no such id or will not give it (it is a Windows-driver
+// concept; elsewhere the driver refuses), and the pointer stays valid for the life of the process.
+const void* device_luid();
+
 // Throws when there is no CUDA device.  The engine targets one architecture and must say so rather than
 // run slowly on something else: `CMakeLists.txt` refuses to COMPILE for another architecture, and
 // this is the matching check at run time (a binary can be carried to a different machine).

@@ -204,6 +204,29 @@ uint64_t lock_test_bytes(bool& reduced) {
 #endif
 }
 
+// The VRAM a plan may take: the smaller of the device's free figure and what the process's budget leaves, and the
+// two exhausted corners must be 0 rather than an underflow. An unanswered query leaves the free figure alone.
+int vram_plan_cases() {
+    using basalt::platform::vram_free_for_plan;
+    struct Case { const char* what; double device_free, budget, usage; bool known; double want; };
+    const Case cases[] = {
+        {"budget roomy: the device's free figure is smaller", 20.0, 30.0, 10.0, true, 20.0},
+        {"budget tight: what the budget leaves is smaller", 20.0, 30.0, 25.0, true, 5.0},
+        {"usage exactly at the budget", 20.0, 30.0, 30.0, true, 0.0},
+        {"usage past the budget (no underflow)", 20.0, 30.0, 40.0, true, 0.0},
+        {"budget unknown: the free figure stands", 20.0, 0.0, 0.0, false, 20.0},
+        {"nothing free either way", 0.0, 30.0, 30.0, true, 0.0},
+    };
+    int fail = 0;
+    for (const Case& c : cases) {
+        const uint64_t got = vram_free_for_plan(gib(c.device_free), c.known, gib(c.budget), gib(c.usage));
+        const bool ok = got == gib(c.want);
+        std::printf("vram plan %-58s -> %llu MiB%s\n", c.what, (unsigned long long) (got >> 20),
+                    ok ? "" : "   <-- WRONG");
+        fail |= !ok;
+    }
+    return fail;
+}
 // The DXGI figures the memory report and the tier check read: a query that ran must carry a budget, and an output
 // count is never a fake zero. A platform without DXGI (or a session that cannot see an adapter) reports not-ok,
 // which the callers read as unknown.
@@ -246,7 +269,8 @@ int large_page_cases() {
 }  // namespace
 
 int main() {
-    int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases() | dxgi_cases() | large_page_cases();
+    int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases() | vram_plan_cases() |
+                     dxgi_cases() | large_page_cases();
     bool reduced = false;
     const uint64_t bytes = lock_test_bytes(reduced);
     if (bytes == 0) {
@@ -257,6 +281,8 @@ int main() {
     if (reduced)
         std::printf("lock_resident: the 256 MiB case is SKIPPED, the locked-memory limit is lower; locking %llu KiB instead\n",
                     (unsigned long long) (bytes >> 10));
+    int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases() | vram_plan_cases() |
+                     dxgi_cases() | large_page_cases();
     void* p = std::malloc(bytes);
     if (p == nullptr) return 2;
     std::memset(p, 1, bytes);
