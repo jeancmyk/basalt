@@ -174,6 +174,8 @@ struct Options {
     /// runs one group while stage k+1 runs another).  1 = every slot in one window, stage after stage.
     int batch_groups = 1;
     std::string spec_oracle;
+    /// Diagnostic: the request's GDN recurrent state, written when it ends, for the per-token oracle comparison.
+    std::string dump_gdn;
     int spec_corrupt = 0;
     /// Names the model's draft layer when it has one (the file); empty means no drafter.
     std::string mtp;

@@ -325,7 +325,6 @@ constexpr float kRelaxedDraftingDefault = 0.5f;   // --relaxed-drafting without 
 
 using basalt::program::Options;
 
-
 /// Calls `f` with the tensor name of every row of a pack index (the first field of each non-comment line).
 bool for_each_index_name(const basalt::core::FileRange& index, const std::function<void(const std::string&)>& f) {
     std::vector<uint8_t> raw;
@@ -1228,6 +1227,7 @@ int main(int argc, char** argv) {
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
+        else if (a == "--dump-gdn") o.dump_gdn = next("--dump-gdn");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--adapt-every") { o.adapt_every = std::atoi(next("--adapt-every")); o.adapt_every_given = true; }
@@ -10673,6 +10673,20 @@ int main(int argc, char** argv) {
             if (pipe_on)
                 basalt::log::info("basalt serve", "pipelined windows: %lld launched, %lld held", (long long) pair_runs,
                                   (long long) pair_holds);
+            if (!o.dump_gdn.empty()) {   // the recurrent state as this request left it, for the per-token oracle
+                const size_t bytes = conv_state_sizes(g, *rsp).gdn;
+                std::vector<uint8_t> host(bytes);
+                std::FILE* f = bytes ? std::fopen(o.dump_gdn.c_str(), "wb") : nullptr;
+                if (f != nullptr && cudaMemcpy(host.data(), rsp->gdn_state, bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                    std::fwrite(host.data(), 1, bytes, f) == bytes) {
+                    std::fclose(f);
+                    std::fprintf(stderr, "basalt serve: GDN state dumped: %zu bytes after %zu tokens -> %s\n", bytes,
+                                 consumed.size(), o.dump_gdn.c_str());
+                } else {
+                    if (f != nullptr) std::fclose(f);
+                    std::fprintf(stderr, "basalt serve: GDN state dump failed: %s\n", o.dump_gdn.c_str());
+                }
+            }
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
                 const double w = (double) dec_windows, L = (double) g.n_layers;
