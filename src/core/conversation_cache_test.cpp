@@ -438,17 +438,17 @@ int main() {
         c.gdn_slot = b.take(7);
         c.gdn.assign(4, 9);
         check(c.gdn_slot == 0 && b.seqlen(0) == 7, "a chain checkpoint holds a slot with its seqlen");
-        gdn_slot_detach(b.book(), c);
+        gdn_slot_detach(b, c);
         check(c.gdn_slot == -1 && b.used() == 0 && b.seqlen(0) == -1 && c.gdn.size() == 4,
               "detaching returns the slot and leaves the host bytes in place");
         check(b.take(7) == 0, "the detached slot is handed out again");
         b.release(0);
         c.gdn_slot = b.take(8);
-        gdn_slot_detach(b.book(), c);
-        gdn_slot_detach(b.book(), c);
+        gdn_slot_detach(b, c);
+        gdn_slot_detach(b, c);
         check(b.used() == 0, "detaching twice frees once");
         ConversationCheckpoint none;   // never slotted: detaching is a no-op
-        gdn_slot_detach(b.book(), none);
+        gdn_slot_detach(b, none);
         check(none.gdn_slot == -1 && b.used() == 0, "a checkpoint without a slot detaches to nothing");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
