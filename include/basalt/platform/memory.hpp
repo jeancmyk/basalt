@@ -178,8 +178,10 @@ struct DxgiMemory {
 /// adapter when `luid` is null.
 DxgiMemory dxgi_memory(const void* luid = nullptr);
 
-/// Print DXGI video-memory budget/usage for the default adapter (Windows; no-op elsewhere).
-void print_dxgi_memory_report();
+/// Print one adapter's video-memory budget and usage (both segment groups) and its output count, and return the same
+/// figures so a caller can compare a plan against them. `luid_matched` says whether `luid` named the device the plan
+/// is for, which is what the first line reports. Nothing prints on a platform that budgets no video memory.
+DxgiMemory print_dxgi_memory_report(const void* luid = nullptr, bool luid_matched = false);
 /// DXGI shared (non-local) memory budget in bytes for the adapter whose LUID matches `luid` (8 bytes),
 /// or 0 when unknown/unavailable. NULL `luid` queries the first adapter.
 uint64_t dxgi_non_local_budget(const void* luid);

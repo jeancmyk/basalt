@@ -10,6 +10,8 @@
 //     engine adapts to the machine it is on" is only true if the engine says what it got.
 #pragma once
 
+#include "basalt/platform/direct_file.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -96,8 +98,22 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
 
 /// Record the arena the memory report describes (may be null).  Called where the arena is created.
 void set_report_arena(PinnedArena* arena);
-/// Print the consolidated memory report (host RAM, arena, VRAM, DXGI, process) to stderr.
-void print_memory_report();
+
+/// What only the caller knows: the VRAM tier it planned and the read rate it measured. The report cannot query
+/// either, so a fact the caller does not have prints as unknown rather than as a zero that reads like a measurement.
+struct ReportFacts {
+    bool tier_known = false;                  ///< false: no tier was planned, so nothing is claimed about one
+    uint64_t tier_bytes = 0;                  ///< device memory the expert tier holds
+    uint64_t tier_slots = 0;                  ///< expert blobs in it
+    uint64_t tier_full_bytes = 0;             ///< what it would hold at its full size
+    std::string ple_io;                       ///< the PLE reader's own line, when it has one
+    basalt::platform::ReadProbe read_probe;   ///< the one-time small-read rate; `ok` false means it was not measured
+};
+
+/// Print the consolidated memory report to stderr: host RAM and commit headroom, the process, the arena, the VRAM
+/// budget per segment with the tier charged against it, the file readers' queue, and the one-time probes. The probes
+/// run on the first call and are cached, so a reprint is cheap and does not measure again.
+void print_memory_report(const ReportFacts& facts);
 
 // FNV-1a 64.  Per layer, so a corrupt or short read names WHICH layer rather than just failing a whole-file
 // comparison - the same reason the Phase 1 tools report the first differing element.
