@@ -879,6 +879,14 @@ DxgiMemory print_dxgi_memory_report(const void* luid, bool luid_matched) {
     return m;
 }
 
+bool budgets_video_memory() {
+#if defined(_WIN32)
+    return true;
+#else
+    return false;
+#endif
+}
+
 uint64_t dxgi_non_local_budget(const void* luid) { return dxgi_memory(luid).non_local_budget; }
 
 bool enable_lock_memory_privilege() {

@@ -3122,22 +3122,29 @@ int main(int argc, char** argv) {
     basalt::core::ExpertCache xcache;
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena
     const bool auto_cache = o.expert_cache < 0;
-    if (o.expert_cache < 0) {
-        // the prompt path's cuBLAS handle is made now, so the free figure below already has its device memory out
-        if (o.serve && o.prefill_chunk > 0 && !basalt::prefill::Gemm::prepare_handle(err)) return fatal_start_error(err);
+    // THE VRAM A PLAN MAY TAKE, READ ONCE.  The device's free figure and the OS budget's headroom are two different
+    // limits on the same plan, and every decision below - the auto sizing, the small-card reserve shrink, the reserve
+    // clamp - has to see the same one of them, or two of those decisions can disagree about how much room there is.
+    // So both readings happen here, once, and every consumer below uses this value.  The free figure is taken on the
+    // first call, which is after the prompt path's cuBLAS handle was made where one is needed, so its device memory
+    // is already out of the figure.  The LOCAL segment's budget is what the driver charges this process against and
+    // its usage figure is this process's own, so budget minus usage is the headroom that stays in device memory.
+    bool budget_known = false;
+    uint64_t local_budget = 0, local_usage = 0;
+    uint64_t plan_free = 0;
+    size_t plan_free_device = 0;
+    bool plan_free_done = false;
+    auto ensure_plan_free = [&]() -> uint64_t {
+        if (plan_free_done) return plan_free;
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        // THE PLAN MAY ONLY TAKE WHAT THE OS BUDGET LEAVES.  A tier sized from the device's free figure can be
-        // placed partly in system memory instead of failing, which is a large, silent slowdown rather than an error.
-        // The LOCAL segment's budget is what the driver charges this process against, and its usage figure is this
-        // process's own, so the two together are the headroom that will stay in device memory.  Without that query
-        // the free figure is the only input, and the startup line says which of the two sized the cache.
-        bool budget_known = false;
-        uint64_t local_budget = 0, local_usage = 0;
-        {
+        plan_free_device = free_b;
+        // --exp dxgi-unavailable=1 pretends the budget query failed, so the path where nothing is clamped can be
+        // exercised on a machine where the budget query always answers. A short-lived gate, not a setting.
+        if (basalt::core::exp_flag("dxgi-unavailable", 0.0) <= 0.0) {
             // The query names the adapter of the device being planned for.  Where the OS budgets no video memory
-            // the answer is not-ok and the free figure stands alone, which is what the platforms without such a
-            // budget need rather than a zero read as a limit.
+            // the answer is not-ok and the free figure stands alone, which is what those platforms need rather
+            // than a zero read as a limit.
             const basalt::platform::DxgiMemory dx = basalt::platform::dxgi_memory(basalt::core::device_luid());
             if (dx.ok && dx.local_budget > 0) {
                 budget_known = true;
@@ -3145,8 +3152,52 @@ int main(int argc, char** argv) {
                 local_usage = dx.local_usage;
             }
         }
-        const uint64_t plan_free = basalt::platform::vram_free_for_plan((uint64_t) free_b, budget_known,
-                                                                        local_budget, local_usage);
+        plan_free = basalt::platform::vram_free_for_plan((uint64_t) free_b, budget_known, local_budget, local_usage);
+        plan_free_done = true;
+        return plan_free;
+    };
+    // A reserve the budget cannot fund is clamped to what is left and said out loud.  Refusing instead would fail a
+    // value that works whenever the GPU is idle, which is not the same case as the flag's existing refusal of a
+    // reserve below the stall floor.  An unavailable budget clamps nothing, and says so when a reserve was asked for:
+    // the auto path's own line already reports the missing budget, so repeating it there would be noise.
+    // `keep_bytes`: room the plan itself needs, which the clamp stops short of, so a large reserve degrades the cache
+    // rather than removing it.  0 for a plan that has already been sized.
+    bool reserve_clamp_said = false;
+    auto clamp_reserve = [&](uint64_t keep_bytes) {
+        if (!budget_known) {
+            // Only a platform that budgets video memory per process can have that budget be unavailable: elsewhere
+            // the query is not made at all, and saying so on every start would be noise rather than information.
+            if (basalt::platform::budgets_video_memory() && o.vram_reserve_given && !reserve_clamp_said) {
+                std::fprintf(stderr, "basalt generate: the LOCAL budget is unavailable, so --vram-reserve-mib %d was "
+                                     "not capped by it\n", o.vram_reserve_mib);
+                reserve_clamp_said = true;
+            }
+            return;
+        }
+        const uint64_t want = (uint64_t) o.vram_reserve_mib << 20;
+        // What the budget leaves, never below the floor that keeps requests able to allocate: in that corner the
+        // reserve is the floor rather than the headroom, which the line's tail says.
+        const uint64_t floor = (uint64_t) kVramStallMib << 20;
+        bool capped = false;
+        const uint64_t got = basalt::platform::vram_reserve_for_plan_keeping(want, plan_free, keep_bytes, floor, &capped);
+        if (!capped) return;
+        const int mib = (int) (got >> 20);
+        if (mib == o.vram_reserve_mib) return;
+        if (!reserve_clamp_said) {
+            std::fprintf(stderr, "basalt generate: --vram-reserve-mib %d leaves more VRAM free than the LOCAL budget "
+                                 "has (%llu MiB of %llu MiB budget in use, %llu MiB left%s), so the reserve is %d MiB%s\n",
+                         o.vram_reserve_mib, (unsigned long long) (local_usage >> 20),
+                         (unsigned long long) (local_budget >> 20), (unsigned long long) (plan_free >> 20),
+                         keep_bytes > 0 ? (", and the plan keeps " + std::to_string(keep_bytes >> 20) + " MiB of it").c_str() : "",
+                         mib, plan_free < floor + keep_bytes ? " (the smallest that keeps requests from stalling)" : "");
+            reserve_clamp_said = true;
+        }
+        o.vram_reserve_mib = mib;
+    };
+    if (o.expert_cache < 0) {
+        // the prompt path's cuBLAS handle is made now, so the free figure below already has its device memory out
+        if (o.serve && o.prefill_chunk > 0 && !basalt::prefill::Gemm::prepare_handle(err)) return fatal_start_error(err);
+        ensure_plan_free();
         // The batched prompt path's chunk buffers are allocated later, so they are reserved here - an over-subscribed
         // allocation can page to system memory and crawl.  With borrowing - the default with a profile - the prompt
         // path lends cache slots instead (`pf_borrow`, hoisted above so both cache-size branches read the same one).
@@ -3176,6 +3227,17 @@ int main(int argc, char** argv) {
             basalt::core::ConversationStateSizes zc;
             std::string ce;
             if (basalt::core::conversation_state_sizes(g, zc, ce)) late_b += (int64_t) zc.gdn;
+        }
+        // The clamp runs here, once the other terms of the reserve are known, and holds back room for the smallest
+        // usable cache: a reserve past the headroom degrades the cache to its minimum rather than removing it.  The
+        // keep figure is those terms plus the smallest cache's bytes, so the sizing below cannot end at 0 slots
+        // because of the cap alone.
+        {
+            const int64_t blob0 = (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
+            const int64_t min_slots0 = (o.prefill_chunk > 0 && pf_borrow)
+                ? ((int64_t) basalt::prefill::Prefill::bytes_needed(g, ss, 256) + blob0 - 1) / blob0 + 128 : 1;
+            const int64_t others = ((int64_t) prefill_mib << 20) + mtp_bind + late_b;
+            clamp_reserve((uint64_t) (std::max<int64_t>(min_slots0, 1) * blob0 + others));
         }
         const int64_t base_b = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + late_b;
         // the RAM copy of the experts the cache does not hold is page-locked and mapped, which takes device memory per
@@ -3207,11 +3269,11 @@ int main(int argc, char** argv) {
                           "%.2f GiB left of the LOCAL budget (budget %llu MiB, this process using %llu MiB; "
                           "cudaMemGetInfo says %.2f GiB)",
                           (double) plan_free / 1073741824.0, (unsigned long long) (local_budget >> 20),
-                          (unsigned long long) (local_usage >> 20), (double) free_b / 1073741824.0);
+                          (unsigned long long) (local_usage >> 20), (double) plan_free_device / 1073741824.0);
         else
             std::snprintf(free_note, sizeof free_note,
                           "%.2f GiB free from cudaMemGetInfo (the LOCAL budget is unavailable, so it did not size "
-                          "this)", (double) free_b / 1073741824.0);
+                          "this)", (double) plan_free_device / 1073741824.0);
         basalt::log::info("basalt generate", "expert cache auto: %s, %d MiB reserved (+%lld MiB for the "
                              "draft head, +%lld MiB for what loads after) -> %d slots",
                      free_note, o.vram_reserve_mib, (long long) (mtp_bind >> 20),
@@ -3296,6 +3358,12 @@ int main(int argc, char** argv) {
                          (long long) prefill_mib, o.vram_reserve_mib, (long long) fit);
             o.expert_cache = (int) fit;
         }
+    } else {
+        // An explicit cache size does not size itself from the budget, but its reserve is still used by the elastic KV
+        // and the serving paths, so the same cap applies to it. The reading happens here rather than above, so the
+        // auto path's free figure keeps the prompt handle's device memory out of it.
+        ensure_plan_free();
+        clamp_reserve(0);   // the cache was asked for by name: its slots are the user's, not this cap's to take
     }
     // A native pack's blobs differ per layer, so with a profile its slots are sized per pair: the same VRAM holds more
     // IQ3_XXS experts than slots of the largest blob would.

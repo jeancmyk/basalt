@@ -27,6 +27,7 @@
 
 namespace {
 uint64_t gib(double g) { return (uint64_t) (g * 1073741824.0); }
+uint64_t mib(double m) { return (uint64_t) (m * 1048576.0); }
 
 // The file tier's unbuffered choice (true = the file cache keeps its reads, so they stay buffered)
 int file_cache_keeps_cases() {
@@ -451,6 +452,56 @@ int vram_plan_cases() {
     }
     return fail;
 }
+// The reserve cap: a want the budget cannot fund is reduced to what the headroom leaves, never below the stall floor,
+// and a want that fits is untouched. Each case says whether the cap fired, because that flag decides whether the
+// startup line is printed.
+int vram_reserve_cases() {
+    using basalt::platform::vram_reserve_for_plan;
+    const uint64_t floor = 256ull << 20;
+    struct Case { const char* what; double want, plan_free, got; bool capped; };
+    const Case cases[] = {
+        {"want fits the headroom: untouched", 700.0, 2048.0, 700.0, false},
+        {"want equals the headroom", 700.0, 700.0, 700.0, false},
+        {"budget headroom is smaller: capped to it", 20000.0, 900.0, 900.0, true},
+        {"headroom under the floor: the floor stands", 20000.0, 64.0, 256.0, true},
+        {"headroom exactly the floor", 20000.0, 256.0, 256.0, true},
+        {"no headroom at all: the floor stands", 20000.0, 0.0, 256.0, true},
+    };
+    int fail = 0;
+    for (const Case& c : cases) {
+        bool capped = false;
+        const uint64_t got = vram_reserve_for_plan(mib(c.want), mib(c.plan_free), floor, &capped);
+        const bool ok = got == mib(c.got) && capped == c.capped;
+        std::printf("vram reserve %-54s -> %llu MiB, capped %s%s\n", c.what, (unsigned long long) (got >> 20),
+                    capped ? "yes" : "no", ok ? "" : "   <-- WRONG");
+        fail |= !ok;
+    }
+    return fail;
+}
+// The same cap when the plan also needs room of its own: the reserve stops `keep` short of the headroom, so a large
+// reserve leaves a small cache rather than none. The floor still wins when there is not enough room for both.
+int vram_reserve_keep_cases() {
+    using basalt::platform::vram_reserve_for_plan_keeping;
+    const uint64_t floor = 256ull << 20;
+    struct Case { const char* what; double want, plan_free, keep, got; bool capped; };
+    const Case cases[] = {
+        {"want fits even after the plan's room", 700.0, 2048.0, 512.0, 700.0, false},
+        {"capped to the headroom less the plan's room", 20000.0, 900.0, 400.0, 500.0, true},
+        {"the plan's room is most of the headroom", 20000.0, 400.0, 300.0, 256.0, true},
+        {"headroom below the plan's room and the floor", 20000.0, 200.0, 300.0, 256.0, true},
+        {"no plan room: the whole headroom is available", 20000.0, 900.0, 0.0, 900.0, true},
+    };
+    int fail = 0;
+    for (const Case& c : cases) {
+        bool capped = false;
+        const uint64_t got = vram_reserve_for_plan_keeping(mib(c.want), mib(c.plan_free), mib(c.keep), floor, &capped);
+        const bool ok = got == mib(c.got) && capped == c.capped;
+        std::printf("vram reserve keep %-49s -> %llu MiB, capped %s%s\n", c.what, (unsigned long long) (got >> 20),
+                    capped ? "yes" : "no", ok ? "" : "   <-- WRONG");
+        fail |= !ok;
+    }
+    return fail;
+}
 // The spill check: an allocation the driver placed partly in system memory lowers the free figure by less than it
 // asked for. Only a shortfall past the tolerance is a spill; a free figure that did not fall says nothing at all.
 int spill_cases() {
@@ -462,7 +513,8 @@ int spill_cases() {
         {"free fell by more than the allocation", 100.0, 60.0, 30.0, 0.0},
         {"free unchanged: nothing to judge", 100.0, 100.0, 30.0, 0.0},
         {"free rose: something else was freed", 100.0, 110.0, 30.0, 0.0},
-        {"shortfall inside the tolerance", 100.0, 70.5, 30.0, 0.0},
+        // the fall is 0.001 GiB (about 1 MiB) short of the allocation, so the shortfall is inside the 32 MiB tolerance
+        {"shortfall inside the tolerance", 100.0, 70.001, 30.0, 0.0},
         {"half of it placed in system memory", 200.0, 150.0, 100.0, 50.0},
         {"a zero-byte allocation", 100.0, 90.0, 0.0, 0.0},
     };
@@ -519,7 +571,7 @@ int large_page_cases() {
 
 int main() {
     int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases() | drop_view_cases() |
-                    guard_reclaim_cases() | reclaim_due_cases() | exhausted_message_cases() | dxgi_cases() | large_page_cases() | vram_plan_cases() | spill_cases();
+                    guard_reclaim_cases() | reclaim_due_cases() | exhausted_message_cases() | dxgi_cases() | large_page_cases() | vram_plan_cases() | spill_cases() | vram_reserve_cases() | vram_reserve_keep_cases();
     bool reduced = false;
     const uint64_t bytes = lock_test_bytes(reduced);
     if (bytes == 0) {
