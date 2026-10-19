@@ -540,19 +540,50 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
     const SIZE_T large = GetLargePageMinimum();
     if (large > 0) {
         // The requested size must be an exact multiple of the large-page minimum; the slack is under one page.
-        const SIZE_T lbytes = (SIZE_T) (((SIZE_T) bytes + large - 1) / large * large);
-        void* p = VirtualAlloc(nullptr, lbytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
-        if (p != nullptr) {
-            got = RegionBacking::LargePages;
-            note = "large pages (" + std::to_string((unsigned long long) large) + " B)";
-            return p;
+        const uint64_t lp_bytes = ((uint64_t) bytes + (uint64_t) large - 1) / (uint64_t) large * (uint64_t) large;
+        // CHUNKED, NOT ALL-OR-NOTHING.  The arena has to stay ONE contiguous range: layer bounds index into it, the
+        // registration covers it as a whole and the destructor releases it in one call.  So the range is reserved
+        // first and then filled piece by piece into that reservation, rather than each piece being its own
+        // allocation.  One all-or-nothing call cannot tell a pool merely smaller than the arena from an absent one,
+        // and it cannot say how far a partial pool would have got.  The chunk matches the commit chunk below, which
+        // keeps the syscall count in the tens for an arena of this size, and it is a multiple of the large-page
+        // minimum.
+        constexpr uint64_t kLargeChunk = 1ull << 30;
+        if (void* p = VirtualAlloc(nullptr, (SIZE_T) lp_bytes, MEM_RESERVE, PAGE_NOACCESS)) {
+            uint64_t off = 0, granted = 0, refused_at = 0;
+            DWORD first_error = 0;
+            for (; off < lp_bytes; off += kLargeChunk) {
+                const uint64_t n = lp_bytes - off < kLargeChunk ? lp_bytes - off : kLargeChunk;
+                if (VirtualAlloc((uint8_t*) p + off, (SIZE_T) n, MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE) == nullptr) {
+                    first_error = GetLastError();
+                    refused_at = off;
+                    break;
+                }
+                granted = off + n;
+            }
+            if (off >= lp_bytes) {
+                got = RegionBacking::LargePages;
+                note = "large pages (" + std::to_string((unsigned long long) large) + " B), " +
+                       std::to_string((lp_bytes + kLargeChunk - 1) / kLargeChunk) + " chunks of up to " +
+                       std::to_string(kLargeChunk >> 20) + " MiB";
+                return p;
+            }
+            // ALL OR NOTHING: a half-converted arena would need a third backing state and would make the TLB
+            // reasoning ambiguous, so the whole reservation goes back and the arena falls back to ordinary pages.
+            // One release covers the committed chunks and the untouched reservation alike, because each chunk
+            // commit replaced a subrange of this same reservation.
+            VirtualFree(p, 0, MEM_RELEASE);
+            // ERROR_NO_SYSTEM_RESOURCES is the page pool declining, ERROR_PRIVILEGE_NOT_HELD is the token and
+            // ERROR_INVALID_PARAMETER a size that is not a multiple of the minimum. They need different fixes, so
+            // the note carries the number, where the loop stopped and how much it had granted by then.
+            note = "large pages refused at " + gib_size(refused_at) + " of " + gib_size(lp_bytes) + ", granted " +
+                   gib_size(granted) + " in " + std::to_string((refused_at + kLargeChunk - 1) / kLargeChunk) +
+                   " chunks (GetLargePageMinimum=" + std::to_string((unsigned long long) large) +
+                   " B, VirtualAlloc error " + std::to_string((unsigned long long) first_error) + "); using 4 KB pages";
+        } else {
+            note = "large pages: cannot reserve " + gib_size(lp_bytes) + " (VirtualAlloc error " +
+                   std::to_string((unsigned long long) GetLastError()) + "); using 4 KB pages";
         }
-        // ERROR_NO_SYSTEM_RESOURCES is the page pool declining, ERROR_PRIVILEGE_NOT_HELD is the token and
-        // ERROR_INVALID_PARAMETER a size that is not a multiple of the minimum. They need different fixes, so the
-        // note carries the number.
-        note = "large pages refused for " + std::to_string((unsigned long long) lbytes) +
-               " B (GetLargePageMinimum=" + std::to_string((unsigned long long) large) + ", VirtualAlloc error " +
-               std::to_string((unsigned long long) GetLastError()) + "); using 4 KB pages";
     } else {
         note = "this system has no large-page minimum; using 4 KB pages";
     }
@@ -738,25 +769,66 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
     }
 
     {
-        void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
-        if (p != MAP_FAILED) {
-            got = RegionBacking::LargePages;
-            note = "hugetlb 2 MB pages";
-            return p;
+        // CHUNKED, NOT ALL-OR-NOTHING.  One mmap(MAP_HUGETLB) over the whole arena fails exactly like an absent
+        // pool when the pool is merely smaller than the arena, and it cannot say how far a partial pool would have
+        // got.  The arena has to stay ONE contiguous range (layer bounds index into it, the registration covers it
+        // whole, the destructor unmaps it in one call), so the range is reserved first and then filled piece by
+        // piece with MAP_FIXED into that reservation.  The chunk matches the Windows commit chunk: tens of syscalls
+        // for an arena of this size, and a multiple of the 2 MiB page.
+        // Linux needs two details Windows does not: the reservation is PROT_NONE and the pieces are MAP_FIXED over
+        // it, and the base is aligned up to 2 MiB by hand with a page of padding, because the kernel only picks a
+        // huge-page-aligned address itself when addr is NULL.  Without that alignment MAP_FIXED fails EINVAL on a
+        // misaligned base and the run would look like a pool refusal.
+        constexpr uint64_t kChunk = 1ull << 30;
+        const uint64_t page = 1ull << 21;
+        const uint64_t huge_bytes = (bytes + page - 1) / page * page;
+        const uint64_t padded = huge_bytes + page;
+        void* raw = mmap(nullptr, (size_t) padded, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (raw != MAP_FAILED) {
+            void* reserved = (void*) (((uintptr_t) raw + page - 1) & ~(uintptr_t) (page - 1));
+            uint64_t off = 0, granted = 0;
+            int first_errno = 0;
+            for (; off < huge_bytes; off += kChunk) {
+                const uint64_t n = huge_bytes - off < kChunk ? huge_bytes - off : kChunk;
+                void* piece = mmap((uint8_t*) reserved + off, (size_t) n, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB | MAP_FIXED, -1, 0);
+                if (piece == MAP_FAILED) {
+                    first_errno = errno;
+                    break;
+                }
+                granted = off + n;
+            }
+            if (off >= huge_bytes) {
+                got = RegionBacking::LargePages;
+                note = "hugetlb 2 MB pages, " + std::to_string((huge_bytes + kChunk - 1) / kChunk) +
+                       " chunks of up to " + std::to_string(kChunk >> 20) + " MiB";
+                // the whole padded reservation, so the one unmap releases the slack too
+                mapping_base = raw;
+                mapping_bytes = padded;
+                return reserved;
+            }
+            // ALL OR NOTHING, as on Windows: a half-converted arena would need a third backing state, so the whole
+            // reservation goes back.  One unmap of the raw span covers the fixed pieces and the untouched
+            // reservation alike, because the MAP_FIXED calls replaced subranges of it.
+            munmap(raw, (size_t) padded);
+            // Name the shortfall, and now also where the loop stopped: a pool that covers part of the arena and one
+            // that will not grant a single page are different failures.
+            const unsigned long long need = (unsigned long long) (huge_bytes / page);
+            unsigned long long pool = 0;
+            bool have_pool = false;
+            if (std::FILE* f = std::fopen("/proc/sys/vm/nr_hugepages", "r")) {
+                have_pool = std::fscanf(f, "%llu", &pool) == 1;
+                std::fclose(f);
+            }
+            note = "MAP_HUGETLB refused at " + std::to_string(off >> 20) + " MiB of " +
+                   std::to_string(huge_bytes >> 20) + " MiB (granted " + std::to_string(granted >> 20) +
+                   " MiB in " + std::to_string((off + kChunk - 1) / kChunk) + " chunks, errno " +
+                   std::to_string(first_errno) + "; needed " + std::to_string(need) + " 2 MiB pages, vm.nr_hugepages=" +
+                   (have_pool ? std::to_string(pool) : std::string("?")) + "); using 4 KB pages";
+        } else {
+            note = "MAP_HUGETLB: cannot reserve " + std::to_string(huge_bytes >> 20) + " MiB (errno " +
+                   std::to_string(errno) + "); using 4 KB pages";
         }
-        // MAP_HUGETLB is all-or-nothing: a pool smaller than the mapping fails exactly like an absent
-        // one, and the old message guessed "no hugetlb pool configured" either way. Name the shortfall:
-        // how many 2 MiB pages the mapping needs against what vm.nr_hugepages actually holds.
-        const unsigned long long need = ((unsigned long long) bytes + (1ull << 21) - 1) / (1ull << 21);
-        unsigned long long pool = 0;
-        bool have_pool = false;
-        if (std::FILE* f = std::fopen("/proc/sys/vm/nr_hugepages", "r")) {
-            have_pool = std::fscanf(f, "%llu", &pool) == 1;
-            std::fclose(f);
-        }
-        note = "MAP_HUGETLB unavailable (needed " + std::to_string(need) + " 2 MiB pages, vm.nr_hugepages=" +
-               (have_pool ? std::to_string(pool) : std::string("?")) + "); using 4 KB pages";
     }
     // No hugetlb mapping: a 2 MiB-aligned anonymous mapping with MADV_HUGEPAGE, so transparent huge pages back
     // it where THP is "madvise" (the common distro default). The CPU expert pool streams whole experts out of
