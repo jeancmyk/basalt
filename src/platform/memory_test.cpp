@@ -203,10 +203,50 @@ uint64_t lock_test_bytes(bool& reduced) {
     return half >= 16 * page ? half : 0;
 #endif
 }
+
+// The DXGI figures the memory report and the tier check read: a query that ran must carry a budget, and an output
+// count is never a fake zero. A platform without DXGI (or a session that cannot see an adapter) reports not-ok,
+// which the callers read as unknown.
+int dxgi_cases() {
+    using namespace basalt::platform;
+    const DxgiMemory m = dxgi_memory(nullptr);
+    if (!m.ok) {
+        std::printf("dxgi %-58s -> no budget reported (unknown)\n", "first adapter");
+        return 0;
+    }
+    const bool budget = m.local_budget > 0;
+    const bool outputs = m.outputs == -1 || m.outputs >= 0;
+    std::printf("dxgi %-58s -> local budget %llu MiB, usage %llu MiB, non-local budget %llu MiB, outputs %s%s\n",
+                "first adapter", (unsigned long long) (m.local_budget >> 20),
+                (unsigned long long) (m.local_usage >> 20), (unsigned long long) (m.non_local_budget >> 20),
+                m.outputs < 0 ? "unknown" : std::to_string(m.outputs).c_str(),
+                budget && outputs ? "" : "   <-- WRONG");
+    return !(budget && outputs);
+}
+
+// The large-page probe must describe the pool without keeping anything: a grant is a multiple of the minimum and no
+// larger than the request, and a refusal names an error. Nothing here fails when the pool declines - that is an
+// answer, not a bug - so only the shape of the report is asserted.
+int large_page_cases() {
+    using namespace basalt::platform;
+    const LargePageProbe p = probe_large_pages(30ull << 30);
+    if (p.minimum == 0) {
+        std::printf("large pages %-50s -> none on this system\n", "30 GiB requested");
+        return 0;
+    }
+    const bool shape = p.granted <= p.requested && p.granted % p.minimum == 0;
+    const bool explained = p.granted > 0 || p.error != 0;
+    std::printf("large pages %-50s -> minimum %llu MiB, granted %llu MiB of %llu MiB%s%s\n", "30 GiB requested",
+                (unsigned long long) (p.minimum >> 20), (unsigned long long) (p.granted >> 20),
+                (unsigned long long) (p.requested >> 20), p.error != 0 ? ", refusal error " : "",
+                p.error != 0 ? std::to_string(p.error).c_str() : "");
+    if (!shape) std::printf("large pages %-50s   <-- WRONG\n", "shape");
+    return !(shape && explained);
+}
 }  // namespace
 
 int main() {
-    int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases();
+    int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases() | dxgi_cases() | large_page_cases();
     bool reduced = false;
     const uint64_t bytes = lock_test_bytes(reduced);
     if (bytes == 0) {

@@ -28,17 +28,22 @@ namespace basalt::platform {
 #if defined(_WIN32)
 namespace {
 /// Enables one privilege in this process's token. A privilege can be assigned to the account and still be absent
-/// from the token until the process asks for it, which is the normal state for an interactive one.
-void enable_privilege(LPCWSTR name) {
+/// from the token until the process asks for it, which is the normal state for an interactive one. False when the
+/// token could not be adjusted - including the case where the account has no such right, which the call fails
+/// silently on.
+bool enable_privilege(LPCWSTR name) {
     HANDLE tok = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) return;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) return false;
+    bool ok = false;
     TOKEN_PRIVILEGES tp{};
     tp.PrivilegeCount = 1;
     if (LookupPrivilegeValueW(nullptr, name, &tp.Privileges[0].Luid)) {
         tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        (void) AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr);
+        if (AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) != 0)
+            ok = GetLastError() == ERROR_SUCCESS;   // it "succeeds" with ERROR_NOT_ALL_ASSIGNED when the right is absent
     }
     CloseHandle(tok);
+    return ok;
 }
 }  // namespace
 #endif
@@ -48,7 +53,7 @@ LockResult lock_resident(void* p, uint64_t bytes) {
     if (p == nullptr || bytes == 0) { r.note = "nothing to lock"; return r; }
 #if defined(_WIN32)
     enable_privilege(L"SeIncreaseWorkingSetPrivilege");   // to raise this process's working set
-    enable_privilege(L"SeLockMemoryPrivilege");          // and to lock pages in it
+    enable_privilege(L"SeLockMemoryPrivilege");           // and to lock pages in it
     HANDLE self = GetCurrentProcess();
     SIZE_T min_ws = 0, max_ws = 0;
     DWORD flags = 0;
@@ -428,8 +433,9 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
     }
     // MEM_LARGE_PAGES needs SeLockMemoryPrivilege, and the account having it assigned is not enough: the process
     // enables it in its own token first. An account without the assignment fails here and falls through to the
-    // ordinary allocation below, which is the expected outcome rather than an error.
-    enable_privilege(L"SeLockMemoryPrivilege");
+    // ordinary allocation below, which is the expected outcome rather than an error. The large-page probe enables it
+    // through the same call, so the two cannot drift apart.
+    (void) enable_lock_memory_privilege();
     const SIZE_T large = GetLargePageMinimum();
     if (large > 0) {
         // The requested size must be an exact multiple of the large-page minimum; the slack is under one page.
@@ -693,81 +699,108 @@ void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const 
 }
 
 
-void print_dxgi_memory_report() {
+DxgiMemory dxgi_memory(const void* luid) {
+    DxgiMemory out;
 #if defined(_WIN32)
     IDXGIFactory1* factory = nullptr;
-    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**) &factory)) || !factory) {
-        std::fprintf(stderr, "  dxgi: CreateDXGIFactory1 failed\n");
-        return;
-    }
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**) &factory)) || !factory) return out;
     IDXGIAdapter1* adapter = nullptr;
-    if (SUCCEEDED(factory->EnumAdapters1(0, &adapter)) && adapter) {
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; ++i) {
+        if (adapter == nullptr) break;
+        bool match = luid == nullptr;
         DXGI_ADAPTER_DESC1 desc{};
-        if (SUCCEEDED(adapter->GetDesc1(&desc)))
-            std::fprintf(stderr, "  dxgi adapter: %ls (vendor 0x%04x)\n", desc.Description, (unsigned) desc.VendorId);
+        if (SUCCEEDED(adapter->GetDesc1(&desc)) && luid != nullptr) {
+            const LUID* pluid = (const LUID*) luid;
+            match = desc.AdapterLuid.LowPart == pluid->LowPart && desc.AdapterLuid.HighPart == pluid->HighPart;
+        }
+        if (!match) {
+            adapter->Release();
+            adapter = nullptr;
+            continue;
+        }
         IDXGIAdapter3* a3 = nullptr;
-        if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**) &a3)) && a3) {
-            for (int g = 0; g < 2; ++g) {
-                DXGI_MEMORY_SEGMENT_GROUP grp = (g == 0) ? DXGI_MEMORY_SEGMENT_GROUP_LOCAL : DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL;
-                DXGI_QUERY_VIDEO_MEMORY_INFO info{};
-                if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, grp, &info)))
-                    std::fprintf(stderr, "  dxgi %s: budget %llu MiB, current usage %llu MiB, available %llu MiB, committed %llu MiB\n",
-                                 g == 0 ? "local" : "non-local",
-                                 (unsigned long long) (info.Budget >> 20), (unsigned long long) (info.CurrentUsage >> 20),
-                                 (unsigned long long) (info.AvailableForReservation >> 20), (unsigned long long) (info.CurrentReservation >> 20));
+        if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**) &a3)) && a3 != nullptr) {
+            DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
+            if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local))) {
+                out.local_budget = (uint64_t) local.Budget;
+                out.local_usage = (uint64_t) local.CurrentUsage;
+                out.ok = true;
+            }
+            if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared))) {
+                out.non_local_budget = (uint64_t) shared.Budget;
+                out.non_local_usage = (uint64_t) shared.CurrentUsage;
             }
             a3->Release();
         }
-        // output count / display-attached
-        IDXGIOutput* out = nullptr;
-        UINT nout = 0;
-        while (adapter->EnumOutputs(nout, &out) == S_OK) { if (out) out->Release(); ++nout; }
-        std::fprintf(stderr, "  dxgi outputs: %u\n", nout);
+        // A failed enumeration is "unknown", not "none": a service or an OpenSSH session cannot enumerate outputs,
+        // and a zero there would let the caller plan the whole budget on a machine that is driving a display.
+        IDXGIOutput* output = nullptr;
+        HRESULT hr = S_OK;
+        int n = 0;
+        while ((hr = adapter->EnumOutputs((UINT) n, &output)) == S_OK) {
+            if (output != nullptr) output->Release();
+            ++n;
+        }
+        out.outputs = hr == DXGI_ERROR_NOT_FOUND ? n : -1;
         adapter->Release();
+        break;
     }
     factory->Release();
+#else
+    (void) luid;
+#endif
+    return out;
+}
+
+void print_dxgi_memory_report() {
+#if defined(_WIN32)
+    const DxgiMemory m = dxgi_memory(nullptr);
+    if (!m.ok) {
+        std::fprintf(stderr, "  dxgi: no adapter reports a video-memory budget\n");
+        return;
+    }
+    std::fprintf(stderr, "  dxgi local: budget %llu MiB, current usage %llu MiB\n",
+                 (unsigned long long) (m.local_budget >> 20), (unsigned long long) (m.local_usage >> 20));
+    std::fprintf(stderr, "  dxgi non-local: budget %llu MiB, current usage %llu MiB\n",
+                 (unsigned long long) (m.non_local_budget >> 20), (unsigned long long) (m.non_local_usage >> 20));
+    if (m.outputs < 0) std::fprintf(stderr, "  dxgi outputs: unknown (the enumeration failed)\n");
+    else std::fprintf(stderr, "  dxgi outputs: %d\n", m.outputs);
 #else
     // no-op
 #endif
 }
 
-uint64_t dxgi_non_local_budget(const void* luid) {
+uint64_t dxgi_non_local_budget(const void* luid) { return dxgi_memory(luid).non_local_budget; }
+
+bool enable_lock_memory_privilege() {
 #if defined(_WIN32)
-    IDXGIFactory1* factory = nullptr;
-    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**) &factory)) || !factory) return 0;
-    uint64_t budget = 0;
-    IDXGIAdapter1* adapter = nullptr;
-    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; ++i) {
-        if (!adapter) continue;
-        DXGI_ADAPTER_DESC1 desc{};
-        if (SUCCEEDED(adapter->GetDesc1(&desc))) {
-            bool match = true;
-            if (luid) {
-                LUID* pluid = (LUID*) luid;
-                match = (desc.AdapterLuid.LowPart == pluid->LowPart &&
-                         desc.AdapterLuid.HighPart == pluid->HighPart);
-            }
-            if (match) {
-                IDXGIAdapter3* a3 = nullptr;
-                if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**) &a3)) && a3) {
-                    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
-                    if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info)))
-                        budget = (uint64_t) info.Budget;
-                    a3->Release();
-                }
-                adapter->Release();
-                break;
-            }
-        }
-        adapter->Release();
-        adapter = nullptr;
-    }
-    factory->Release();
-    return budget;
+    return enable_privilege(L"SeLockMemoryPrivilege");
 #else
-    (void) luid;
-    return 0;
+    return false;
 #endif
+}
+
+LargePageProbe probe_large_pages(uint64_t want) {
+    LargePageProbe p;
+#if defined(_WIN32)
+    p.minimum = (uint64_t) GetLargePageMinimum();
+    p.requested = want;
+    if (p.minimum == 0) return p;
+    enable_lock_memory_privilege();   // the pool needs the privilege in this token, whatever the arena did
+    const uint64_t floor = p.minimum * 32;   // the smallest block worth reporting
+    for (uint64_t ask = want / p.minimum * p.minimum; ask >= floor; ask = ask / 2 / p.minimum * p.minimum) {
+        void* got = VirtualAlloc(nullptr, (SIZE_T) ask, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+        if (got != nullptr) {
+            VirtualFree(got, 0, MEM_RELEASE);
+            p.granted = ask;
+            return p;
+        }
+        if (p.error == 0) p.error = (uint64_t) GetLastError();
+    }
+#else
+    (void) want;
+#endif
+    return p;
 }
 
 }  // namespace basalt::platform
