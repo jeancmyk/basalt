@@ -213,6 +213,15 @@ int selftest(const std::string& dir, uint32_t rb) {
             std::printf("probe_reads 4 KiB x %llu at depth 8: %.0f reads/s, %.1f MiB/s\n",
                         (unsigned long long) pr.reads, pr.reads_per_s(), pr.gib_per_s() * 1024.0);
         }
+        // The same probe with a view of the file held for its timed run: the confound-free arm of the comparison.
+        const basalt::platform::ReadProbe pv = basalt::platform::probe_reads(path, 4096, 8, 64, /*hold_view=*/true);
+        CHECK(pv.ok, "probe_reads with a held view: %s", pv.error.c_str());
+        if (pv.ok) {
+            CHECK(pv.reads == 64 && pv.failed == 0, "probe_reads held view: %llu reads, %llu failed",
+                  (unsigned long long) pv.reads, (unsigned long long) pv.failed);
+            std::printf("probe_reads 4 KiB with a held view: %.0f reads/s, %.1f MiB/s\n",
+                        pv.reads_per_s(), pv.gib_per_s() * 1024.0);
+        }
     }
     std::filesystem::remove(path);
     std::printf("ple_reader selftest (row_bytes=%u): %s\n", rb, g_fail ? "FAILED" : "OK");

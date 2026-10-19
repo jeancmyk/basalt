@@ -17,6 +17,7 @@
 #include "basalt/platform/win.hpp"
 #else
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -489,12 +490,12 @@ IoStats DirectFile::stats() const {
     return s;
 }
 
-ReadProbe probe_reads(const std::string& path, uint32_t read_bytes, uint32_t depth, uint32_t reads) {
+ReadProbe probe_reads(const std::string& path, uint32_t read_bytes, uint32_t depth, uint32_t reads, bool hold_view) {
     ReadProbe r;
     const uint32_t align = DirectFile::alignment();
     if (read_bytes == 0 || read_bytes % align != 0) { r.error = "probe: the read size is not a multiple of the alignment"; return r; }
     if (reads == 0) { r.error = "probe: no reads asked for"; return r; }
-    depth = std::clamp<uint32_t>(depth, 1, 64);
+    depth = std::clamp<uint32_t>(depth, 1, 256);   // deep enough to tell a queue limit from a per-read one
     if (depth > reads) depth = reads;
     DirectFile f;
     std::string err;
@@ -554,17 +555,67 @@ ReadProbe probe_reads(const std::string& path, uint32_t read_bytes, uint32_t dep
         r.error = err.empty() ? "probe: the warm-up reads failed" : err;
         return r;
     }
+    // A view of the same file, held for the timed run only: this is what makes the two rates comparable, because
+    // nothing else about the reads changes. It is mapped whole, as the expert tier maps it.
+    void* view = nullptr;
+    uint64_t view_bytes = f.size();
+    if (hold_view) {
+#if defined(_WIN32)
+        HANDLE fh = CreateFileW(to_wide(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (fh != INVALID_HANDLE_VALUE) {
+            HANDLE map = CreateFileMappingW(fh, nullptr, PAGE_READONLY, 0, 0, nullptr);
+            if (map != nullptr) {
+                view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0);
+                CloseHandle(map);
+            }
+            CloseHandle(fh);
+        }
+#else
+        const int vfd = ::open(path.c_str(), O_RDONLY);
+        if (vfd >= 0) {
+            struct stat vst{};
+            if (fstat(vfd, &vst) == 0 && vst.st_size > 0) {
+                view_bytes = (uint64_t) vst.st_size;
+                void* v = mmap(nullptr, (size_t) view_bytes, PROT_READ, MAP_PRIVATE, vfd, 0);
+                if (v != MAP_FAILED) view = v;
+            }
+            ::close(vfd);
+        }
+#endif
+        if (view == nullptr) {
+            for (uint32_t j = 0; j < depth; ++j) DirectFile::free_aligned(buf[j]);
+            r.error = "probe: cannot map the file for the view arm";
+            return r;
+        }
+        // Fault a bounded prefix of the section through the view, before the clock starts, so this arm is a section
+        // WITH resident pages rather than only a section object. The tier's view is populated as it is read; this is
+        // the same kind of state over the first 64 MiB. None of it is in the timed batch's buffers.
+        {
+            const uint64_t touch = std::min<uint64_t>(view_bytes, 64ull << 20);
+            volatile uint8_t sink = 0;
+            for (uint64_t off = 0; off < touch; off += 65536)
+                sink = (uint8_t) (sink + ((const volatile uint8_t*) view)[off]);
+            (void) sink;
+        }
+    }
     const double t0 = now_us();
-    if (!run(depth, reads, &r.bytes, &r.failed)) {
-        for (uint32_t j = 0; j < depth; ++j) DirectFile::free_aligned(buf[j]);
+    const bool timed_ok = run(depth, reads, &r.bytes, &r.failed);
+    r.seconds = (now_us() - t0) / 1e6;
+    if (view != nullptr) {
+#if defined(_WIN32)
+        UnmapViewOfFile(view);
+#else
+        munmap(view, (size_t) view_bytes);
+#endif
+    }
+    for (uint32_t j = 0; j < depth; ++j) DirectFile::free_aligned(buf[j]);
+    if (!timed_ok) {
         r.error = err.empty() ? "probe: the timed reads failed" : err;
         return r;
     }
-    r.seconds = (now_us() - t0) / 1e6;
     r.reads = reads;
     r.read_bytes = read_bytes;
     r.depth = depth;
-    for (uint32_t j = 0; j < depth; ++j) DirectFile::free_aligned(buf[j]);
     r.ok = r.seconds > 0;
     return r;
 }
