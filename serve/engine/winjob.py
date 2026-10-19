@@ -109,3 +109,22 @@ def breakaway_flags() -> int:
     if os.name != "nt":
         return 0
     return 0x01000000   # CREATE_BREAKAWAY_FROM_JOB
+
+
+def popen(args, **kwargs):
+    """`subprocess.Popen`, with the child opted out of an enclosing job where that is permitted.
+
+    A job that forbids breakaway does not quietly ignore `CREATE_BREAKAWAY_FROM_JOB`: it fails the spawn
+    outright with `ERROR_ACCESS_DENIED`, which looks like a permissions problem on the engine binary and
+    is nothing of the sort. A supervisor that runs the server inside its own job (llama-swap and others)
+    hits exactly that, so the flag is dropped and the child spawned again without it. The child then stays
+    in the supervisor's job, which is the containment the supervisor was asking for in the first place.
+    """
+    import subprocess
+    flags = int(kwargs.pop("creationflags", 0)) | breakaway_flags()
+    try:
+        return subprocess.Popen(args, creationflags=flags, **kwargs)
+    except OSError as exc:
+        if flags == 0 or getattr(exc, "winerror", None) != 5:
+            raise     # not the job's doing: a real access problem, or nothing to do about it
+        return subprocess.Popen(args, creationflags=0, **kwargs)

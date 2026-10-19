@@ -169,10 +169,9 @@ class ProcessEngine:
                 threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
         sink = None if log else ProcessEngine.stderr_sink
         self.max_context = 0                            # before the new process is visible: never its predecessor's
-        self.proc = subprocess.Popen([engine_bin, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE if sink else self.log, text=True, encoding="utf-8",
-                                      bufsize=1, env=env,
-                                      creationflags=winjob.breakaway_flags())
+        self.proc = winjob.popen([engine_bin, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE if sink else self.log, text=True, encoding="utf-8",
+                                 bufsize=1, env=env)
         frame_pipes(self.proc, sink is not None)
         winjob.contain(self.proc)
         if sink:
