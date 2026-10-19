@@ -48,6 +48,9 @@ public:
         for (int64_t s : seqlen_) n += s >= 0 ? 1 : 0;
         return n;
     }
+    /// Slots a checkpoint may still take.  `slots() - used()` is the same number; this names it for the tests that
+    /// check a dropped checkpoint gives its slot back.
+    int free() const { return (int) free_.size(); }
 
 private:
     std::vector<int64_t> seqlen_;   // -1: free
