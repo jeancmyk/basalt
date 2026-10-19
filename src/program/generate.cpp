@@ -5102,7 +5102,7 @@ int main(int argc, char** argv) {
         // expert cache's tier is unchanged.  A checkpoint whose slot cannot be had keeps host bytes.
         size_t gdn_state_bytes = 0;
         {
-            const ConvStateSizes zz = conv_state_sizes(g, *rsp);
+            const ConvStateSizes zz = conv_state_sizes(g, ss);
             std::string se;
             if (o.prompt_cache > 0 && stages.empty() && zz.gdn > 0 && g_gdn_slots.reserve(2, zz.gdn, se)) {
                 gdn_state_bytes = zz.gdn;
