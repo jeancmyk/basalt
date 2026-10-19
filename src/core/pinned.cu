@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdlib>
@@ -293,22 +294,63 @@ StreamStats stream_bandwidth(const uint8_t* src, uint64_t bytes, uint64_t chunk,
 
 namespace {
 PinnedArena* g_report_arena = nullptr;
+
+/// The two one-time probes. Each runs on the first report and is cached, so a reprint does not touch the device or
+/// the drive again.
+struct H2dProbe {
+    bool ok = false;
+    uint64_t bytes = 0;
+    uint64_t chunk = 0;
+    double gib_per_s = 0;
+};
+
+H2dProbe h2d_probe_once() {
+    static const H2dProbe p = [] {
+        H2dProbe r;
+        if (g_report_arena == nullptr || g_report_arena->registered_bytes == 0) return r;
+        const uint64_t chunk = 8ull << 20;
+        uint64_t bytes = std::min<uint64_t>(g_report_arena->registered_bytes, 512ull << 20);
+        bytes = bytes / chunk * chunk;
+        if (bytes < chunk) return r;
+        const StreamStats st = stream_bandwidth(g_report_arena->data(), bytes, chunk, 2);
+        if (st.seconds <= 0.0) return r;
+        r.ok = true;
+        r.bytes = st.bytes;
+        r.chunk = chunk;
+        r.gib_per_s = st.gib_per_second();
+        return r;
+    }();
+    return p;
+}
+
+basalt::platform::LargePageProbe large_page_probe_once() {
+    static const basalt::platform::LargePageProbe p = [] {
+        const uint64_t want = g_report_arena != nullptr && g_report_arena->capacity > 0
+                                  ? g_report_arena->capacity
+                                  : (1ull << 30);
+        return basalt::platform::probe_large_pages(want);
+    }();
+    return p;
+}
 }  // namespace
 
 void set_report_arena(PinnedArena* arena) { g_report_arena = arena; }
 
-void print_memory_report() {
-    static bool printed = false;
-    if (printed) return;
-    printed = true;
+void print_memory_report(const ReportFacts& facts) {
     std::fprintf(stderr, "basalt memory-report:\n");
     // Every figure comes from the platform probe, so one line reads out the same way on both platforms: what the OS
     // has, what it can still hand out, and what it can still commit - the pair a page-locked arena must fit inside.
-    std::fprintf(stderr, "  host: total phys %llu MiB, avail phys %llu MiB, commit limit %llu MiB, commit headroom %llu MiB\n",
-                 (unsigned long long) (basalt::platform::total_physical_memory() >> 20),
-                 (unsigned long long) (basalt::platform::available_memory() >> 20),
-                 (unsigned long long) (basalt::platform::commit_limit() >> 20),
-                 (unsigned long long) (basalt::platform::commit_headroom() >> 20));
+    // A probe that did not answer says so rather than printing zeros.
+    const uint64_t phys_total = basalt::platform::total_physical_memory();
+    if (phys_total == 0) {
+        std::fprintf(stderr, "  host: unknown (the OS gave no memory reading)\n");
+    } else {
+        std::fprintf(stderr, "  host: total phys %llu MiB, avail phys %llu MiB, commit limit %llu MiB, commit headroom %llu MiB\n",
+                     (unsigned long long) (phys_total >> 20),
+                     (unsigned long long) (basalt::platform::available_memory() >> 20),
+                     (unsigned long long) (basalt::platform::commit_limit() >> 20),
+                     (unsigned long long) (basalt::platform::commit_headroom() >> 20));
+    }
     const basalt::platform::ProcessMemory pmem = basalt::platform::process_memory();
     std::fprintf(stderr, "  process: resident %llu MiB, peak resident %llu MiB, private %llu MiB\n",
                  pmem.rss_mib, pmem.peak_rss_mib, pmem.private_mib);
@@ -339,11 +381,125 @@ void print_memory_report() {
     } else {
         std::fprintf(stderr, "  arena: none recorded\n");
     }
+    // What the large-page pool would grant, once: a pool that declines an arena can still fund part of one. A
+    // privilege the token does not hold is the session's ceiling rather than the pool's, so it is named as such.
+    {
+        const basalt::platform::LargePageProbe lp = large_page_probe_once();
+        if (lp.minimum == 0) {
+            std::fprintf(stderr, "  large pages: none on this system\n");
+        } else if (lp.granted > 0) {
+            std::fprintf(stderr, "  large pages: minimum %llu MiB, the pool grants %llu MiB of the %llu MiB requested\n",
+                         (unsigned long long) (lp.minimum >> 20), (unsigned long long) (lp.granted >> 20),
+                         (unsigned long long) (lp.requested >> 20));
+        } else if (lp.error == 1314) {
+            std::fprintf(stderr, "  large pages: minimum %llu MiB, the token does not hold the privilege (1314), so "
+                                 "none of the %llu MiB requested was granted - the session's ceiling, not the pool's\n",
+                         (unsigned long long) (lp.minimum >> 20), (unsigned long long) (lp.requested >> 20));
+        } else {
+            std::fprintf(stderr, "  large pages: minimum %llu MiB, the pool grants none of the %llu MiB requested "
+                                 "(error %llu)\n", (unsigned long long) (lp.minimum >> 20),
+                         (unsigned long long) (lp.requested >> 20), (unsigned long long) lp.error);
+        }
+    }
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
-        std::fprintf(stderr, "  vram: free %llu MiB / total %llu MiB\n",
+        std::fprintf(stderr, "  vram: free %llu MiB / total %llu MiB (cudaMemGetInfo)\n",
                      (unsigned long long) (free_b >> 20), (unsigned long long) (total_b >> 20));
-    basalt::platform::print_dxgi_memory_report();   // reports nothing where the display driver does not budget VRAM
+    else
+        std::fprintf(stderr, "  vram: unknown (cudaMemGetInfo failed)\n");
+    // The budget that matters is the one the process is charged against, so the query is matched to the CUDA
+    // device's LUID. When the device properties cannot be read there is no LUID to match, and the figures are the
+    // first adapter's - said on the line rather than passed off as the device's. Where the OS budgets no video
+    // memory at all, the query reports not-ok and every comparison below says so instead of guessing.
+    const void* luid = nullptr;
+    bool luid_known = false;
+    {
+        int dev = 0;
+        cudaDeviceProp prop{};
+        if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+            luid = (const void*) prop.luid;
+            luid_known = true;
+        } else {
+            cudaGetLastError();
+        }
+    }
+    const basalt::platform::DxgiMemory dx = basalt::platform::print_dxgi_memory_report(luid, luid_known);
+    // Device memory is charged to the LOCAL segment and page-locked memory the GPU maps to the shared (NON_LOCAL)
+    // one, so each plan is compared against its own budget and every verdict names the segment it is about.
+    if (!facts.tier_known) {
+        std::fprintf(stderr, "  tier: unknown (no expert-tier facts recorded)\n");
+    } else if (facts.tier_bytes == 0) {
+        std::fprintf(stderr, "  tier: none (no expert cache)\n");
+    } else if (!dx.ok) {
+        std::fprintf(stderr, "  tier: %llu MiB in %llu slots (full %llu MiB), charged to the LOCAL segment; the local "
+                             "budget is unknown, so it cannot be compared\n",
+                     (unsigned long long) (facts.tier_bytes >> 20), (unsigned long long) facts.tier_slots,
+                     (unsigned long long) (facts.tier_full_bytes >> 20));
+    } else if (dx.local_usage > dx.local_budget) {
+        std::fprintf(stderr, "  tier: %llu MiB in %llu slots (full %llu MiB), charged to the LOCAL segment: usage is "
+                             "over the local budget by %llu MiB, so the driver can place that much in system memory\n",
+                     (unsigned long long) (facts.tier_bytes >> 20), (unsigned long long) facts.tier_slots,
+                     (unsigned long long) (facts.tier_full_bytes >> 20),
+                     (unsigned long long) (dx.local_usage - dx.local_budget));
+    } else {
+        std::fprintf(stderr, "  tier: %llu MiB in %llu slots (full %llu MiB), charged to the LOCAL segment: within the "
+                             "local budget, %llu MiB of headroom left\n",
+                     (unsigned long long) (facts.tier_bytes >> 20), (unsigned long long) facts.tier_slots,
+                     (unsigned long long) (facts.tier_full_bytes >> 20),
+                     (unsigned long long) (dx.local_budget - dx.local_usage));
+    }
+    if (g_report_arena != nullptr && g_report_arena->registered_bytes > 0) {
+        if (!dx.ok) {
+            std::fprintf(stderr, "  arena charge: %llu MiB registered, charged to the shared (NON_LOCAL) segment; that "
+                                 "budget is unknown\n",
+                         (unsigned long long) (g_report_arena->registered_bytes >> 20));
+        } else if (dx.non_local_usage > dx.non_local_budget) {
+            std::fprintf(stderr, "  arena charge: %llu MiB registered, charged to the shared (NON_LOCAL) segment: usage "
+                                 "is over the non-local budget by %llu MiB\n",
+                         (unsigned long long) (g_report_arena->registered_bytes >> 20),
+                         (unsigned long long) (dx.non_local_usage - dx.non_local_budget));
+        } else {
+            std::fprintf(stderr, "  arena charge: %llu MiB registered, charged to the shared (NON_LOCAL) segment: within "
+                                 "the non-local budget, %llu MiB of headroom left\n",
+                         (unsigned long long) (g_report_arena->registered_bytes >> 20),
+                         (unsigned long long) (dx.non_local_budget - dx.non_local_usage));
+        }
+    }
+    // The file readers' queue: a rate on its own cannot tell a slow drive from a queue that never went deep.
+    {
+        const basalt::platform::IoStats io = basalt::platform::io_stats();
+        if (io.issuing_threads == 0 && io.submitted == 0) {
+            std::fprintf(stderr, "  io: no reader open\n");
+        } else {
+            std::fprintf(stderr, "  io: %d issuing threads, %llu queued, %llu in flight (peak %llu), %llu submitted, "
+                                 "%llu completed (%llu failed), %llu MiB\n",
+                         io.issuing_threads, (unsigned long long) io.queued, (unsigned long long) io.inflight,
+                         (unsigned long long) io.peak_inflight, (unsigned long long) io.submitted,
+                         (unsigned long long) io.completed, (unsigned long long) io.failed,
+                         (unsigned long long) (io.bytes >> 20));
+        }
+    }
+    if (!facts.ple_io.empty()) std::fprintf(stderr, "  io note: %s\n", facts.ple_io.c_str());
+    // The two one-time probes. A probe that could not run says so: an unmeasured rate is not a zero.
+    {
+        const H2dProbe h2d = h2d_probe_once();
+        if (h2d.ok) {
+            std::fprintf(stderr, "  probe h2d: %.1f GiB/s from the registered arena in %llu MiB chunks (%llu MiB "
+                                 "moved)\n", h2d.gib_per_s, (unsigned long long) (h2d.chunk >> 20),
+                         (unsigned long long) (h2d.bytes >> 20));
+        } else {
+            std::fprintf(stderr, "  probe h2d: not measured (no registered arena)\n");
+        }
+    }
+    if (facts.read_probe.ok) {
+        std::fprintf(stderr, "  probe reads: %u B x %llu at depth %u: %.0f reads/s, %.1f MiB/s, %llu failed\n",
+                     facts.read_probe.read_bytes, (unsigned long long) facts.read_probe.reads,
+                     facts.read_probe.depth, facts.read_probe.reads_per_s(),
+                     facts.read_probe.gib_per_s() * 1024.0, (unsigned long long) facts.read_probe.failed);
+    } else {
+        std::fprintf(stderr, "  probe reads: not measured%s%s\n", facts.read_probe.error.empty() ? "" : ": ",
+                     facts.read_probe.error.c_str());
+    }
 }
 
 }  // namespace basalt::core
