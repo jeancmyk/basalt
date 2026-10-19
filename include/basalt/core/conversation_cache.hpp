@@ -8,9 +8,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <new>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -201,12 +203,49 @@ struct SavedConversation {
     }
 };
 
+/// Element-by-element token equality, any token width.  The reference the bulk compare has to agree with.
+template<class Token>
+bool conversation_ids_equal_linear(const int32_t* ids, size_t n, const Token* prompt) {
+    for (size_t i = 0; i < n; ++i)
+        if (!(ids[i] == prompt[i])) return false;
+    return true;
+}
+
+/// Length of the common prefix of two int32 token spans, bulk-compared: exponential doubling finds the first window
+/// that differs, then a bisection inside it, each probe one slice compare.  A long shared prefix - the agentic case -
+/// costs a handful of compares and scans every token once, instead of one compare per token.
+inline size_t conversation_common_prefix(const int32_t* a, const int32_t* b, size_t n) {
+    size_t done = 0, window = 1;   // [0, done) is equal
+    while (done < n) {
+        const size_t len = std::min(n - done, window);
+        if (std::memcmp(a + done, b + done, len * sizeof(int32_t)) != 0) {
+            size_t lo = done, hi = done + len;   // the first difference is in [lo, hi)
+            while (hi - lo > 1) {
+                const size_t mid = lo + (hi - lo) / 2;
+                if (std::memcmp(a + lo, b + lo, (mid - lo) * sizeof(int32_t)) == 0) lo = mid;
+                else hi = mid;
+            }
+            return lo;
+        }
+        done += len;
+        if (window < n) window = std::min(window * 2, n);
+    }
+    return n;
+}
+
+/// conversation_ids_equal_linear's answer, int32 tokens compared in bulk.
+template<class Token>
+bool conversation_ids_equal(const int32_t* ids, size_t n, const Token* prompt) {
+    if constexpr (std::is_same_v<Token, int32_t>) return conversation_common_prefix(ids, prompt, n) == n;
+    else return conversation_ids_equal_linear(ids, n, prompt);
+}
+
 template<class Token>
 int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
                             const std::vector<ConversationImageKey>& images) {
     const size_t n = c.ids.size();
     // The last prompt token always starts the next verify window.
-    if (n == 0 || n >= prompt.size() || !std::equal(c.ids.begin(), c.ids.end(), prompt.begin())) return 0;
+    if (n == 0 || n >= prompt.size() || !conversation_ids_equal(c.ids.data(), n, prompt.data())) return 0;
     size_t j = 0;
     for (const auto& image : images) {
         if (image.start >= (int64_t) n) continue;
