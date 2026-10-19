@@ -1,6 +1,7 @@
 // src/core/pinned.cu - the pinned host arena and the parallel expert load.
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/pinned.hpp"
+#include "basalt/core/device.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/platform/system.hpp"
@@ -79,12 +80,10 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             // Stop below the shared-memory budget rather than at the driver's refusal, and only when the budget is
             // actually smaller than the arena: an arena the segment can hold is pinned whole, as before.
             if (!capped) {
-                // The budget belongs to the adapter this arena is pinned for, so name that adapter by LUID.
-                cudaDeviceProp prop{};
-                const bool have_prop = cudaGetDeviceProperties(&prop, 0) == cudaSuccess;
+                // The budget belongs to the adapter this arena is pinned for, so name that adapter by its id.
                 uint64_t seg = 0;
                 std::string seg_why;
-                if (basalt::platform::pin_budget(seg, seg_why, have_prop ? &prop.luid : nullptr) && seg < bytes) {
+                if (basalt::platform::pin_budget(seg, seg_why, basalt::core::device_luid()) && seg < bytes) {
                     limited = true;
                     limit = seg;
                     limit_why = std::move(seg_why);
@@ -408,23 +407,12 @@ void print_memory_report(const ReportFacts& facts) {
                      (unsigned long long) (free_b >> 20), (unsigned long long) (total_b >> 20));
     else
         std::fprintf(stderr, "  vram: unknown (cudaMemGetInfo failed)\n");
-    // The budget that matters is the one the process is charged against, so the query is matched to the CUDA
-    // device's LUID. When the device properties cannot be read there is no LUID to match, and the figures are the
-    // first adapter's - said on the line rather than passed off as the device's. Where the OS budgets no video
-    // memory at all, the query reports not-ok and every comparison below says so instead of guessing.
-    const void* luid = nullptr;
-    bool luid_known = false;
-    {
-        int dev = 0;
-        cudaDeviceProp prop{};
-        if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
-            luid = (const void*) prop.luid;
-            luid_known = true;
-        } else {
-            cudaGetLastError();
-        }
-    }
-    const basalt::platform::DxgiMemory dx = basalt::platform::print_dxgi_memory_report(luid, luid_known);
+    // The budget that matters is the one the process is charged against, so the query is matched to the device
+    // being reported on. When the driver gives no id there is nothing to match, and the figures are the first
+    // adapter's - said on the line rather than passed off as the device's. Where the OS budgets no video memory
+    // at all, the query reports not-ok and every comparison below says so instead of guessing.
+    const void* luid = basalt::core::device_luid();
+    const basalt::platform::DxgiMemory dx = basalt::platform::print_dxgi_memory_report(luid, luid != nullptr);
     // Device memory is charged to the LOCAL segment and page-locked memory the GPU maps to the shared (NON_LOCAL)
     // one, so each plan is compared against its own budget and every verdict names the segment it is about.
     if (!facts.tier_known) {

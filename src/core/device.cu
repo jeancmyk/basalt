@@ -2,6 +2,7 @@
 #include "basalt/core/device.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda.h>   // the driver types behind device_luid()
 
 #include <algorithm>
 #include <cstdio>
@@ -100,6 +101,39 @@ double device_h2d_gbps(int ordinal) {
     cudaGetLastError();
     cudaSetDevice(prev);
     return best;
+}
+
+const void* device_luid() {
+    // The runtime's property struct carries the id on some platforms only, so it comes from the driver instead,
+    // reached through the runtime's own entry-point lookup the way vmm.cpp reaches the driver.  A driver without
+    // the id, or one that refuses it, leaves the caller with nullptr and no more than a guess at the adapter.
+    static const void* cached = [] {
+        static char luid[8];
+        void* fn = nullptr;
+        cudaDriverEntryPointQueryResult q{};
+#if CUDART_VERSION >= 12050
+        const cudaError_t e = cudaGetDriverEntryPointByVersion("cuDeviceGetLuid", &fn, 12000, cudaEnableDefault, &q);
+#else
+        const cudaError_t e = cudaGetDriverEntryPoint("cuDeviceGetLuid", &fn, cudaEnableDefault, &q);
+#endif
+        if (e != cudaSuccess || q != cudaDriverEntryPointSuccess || fn == nullptr) {
+            (void) cudaGetLastError();
+            return (const void*) nullptr;
+        }
+        int ord = 0;
+        if (cudaGetDevice(&ord) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return (const void*) nullptr;
+        }
+        unsigned mask = 0;
+        auto get = reinterpret_cast<CUresult (CUDAAPI*)(char*, unsigned int*, CUdevice)>(fn);
+        if (get(luid, &mask, (CUdevice) ord) != CUDA_SUCCESS) {
+            (void) cudaGetLastError();
+            return (const void*) nullptr;
+        }
+        return (const void*) luid;
+    }();
+    return cached;
 }
 
 }  // namespace basalt::core

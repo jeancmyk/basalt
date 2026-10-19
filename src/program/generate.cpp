@@ -3114,6 +3114,26 @@ int main(int argc, char** argv) {
         if (o.serve && o.prefill_chunk > 0 && !basalt::prefill::Gemm::prepare_handle(err)) return fatal_start_error(err);
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
+        // THE PLAN MAY ONLY TAKE WHAT THE OS BUDGET LEAVES.  A tier sized from the device's free figure can be
+        // placed partly in system memory instead of failing, which is a large, silent slowdown rather than an error.
+        // The LOCAL segment's budget is what the driver charges this process against, and its usage figure is this
+        // process's own, so the two together are the headroom that will stay in device memory.  Without that query
+        // the free figure is the only input, and the startup line says which of the two sized the cache.
+        bool budget_known = false;
+        uint64_t local_budget = 0, local_usage = 0;
+        {
+            // The query names the adapter of the device being planned for.  Where the OS budgets no video memory
+            // the answer is not-ok and the free figure stands alone, which is what the platforms without such a
+            // budget need rather than a zero read as a limit.
+            const basalt::platform::DxgiMemory dx = basalt::platform::dxgi_memory(basalt::core::device_luid());
+            if (dx.ok && dx.local_budget > 0) {
+                budget_known = true;
+                local_budget = dx.local_budget;
+                local_usage = dx.local_usage;
+            }
+        }
+        const uint64_t plan_free = basalt::platform::vram_free_for_plan((uint64_t) free_b, budget_known,
+                                                                        local_budget, local_usage);
         // The batched prompt path's chunk buffers are allocated later, so they are reserved here - an over-subscribed
         // allocation can page to system memory and crawl.  With borrowing - the default with a profile - the prompt
         // path lends cache slots instead (`pf_borrow`, hoisted above so both cache-size branches read the same one).
@@ -3158,24 +3178,35 @@ int main(int argc, char** argv) {
                 cudaFreeHost(probe);
                 const double per_gib = f0 > f1 ? (double) (f0 - f1) : 0.0;
                 const double outside = std::max(0.0, (double) expert_total_bytes -
-                                                         (double) std::max<int64_t>((int64_t) free_b - base_b, 0));
+                                                         (double) std::max<int64_t>((int64_t) plan_free - base_b, 0));
                 late_b += (int64_t) (per_gib * outside / (double) pb);
             }
             cudaGetLastError();
         }
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + late_b;
         const int64_t blob = (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
-        int64_t slots = ((int64_t) free_b - reserve) / blob;
+        int64_t slots = ((int64_t) plan_free - reserve) / blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
-        basalt::log::info("basalt generate", "expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
+        char free_note[320];
+        if (budget_known)
+            std::snprintf(free_note, sizeof free_note,
+                          "%.2f GiB left of the LOCAL budget (budget %llu MiB, this process using %llu MiB; "
+                          "cudaMemGetInfo says %.2f GiB)",
+                          (double) plan_free / 1073741824.0, (unsigned long long) (local_budget >> 20),
+                          (unsigned long long) (local_usage >> 20), (double) free_b / 1073741824.0);
+        else
+            std::snprintf(free_note, sizeof free_note,
+                          "%.2f GiB free from cudaMemGetInfo (the LOCAL budget is unavailable, so it did not size "
+                          "this)", (double) free_b / 1073741824.0);
+        basalt::log::info("basalt generate", "expert cache auto: %s, %d MiB reserved (+%lld MiB for the "
                              "draft head, +%lld MiB for what loads after) -> %d slots",
-                     (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20),
+                     free_note, o.vram_reserve_mib, (long long) (mtp_bind >> 20),
                      (long long) (late_b >> 20), o.expert_cache);
         // The batch slots' sessions came out of the same VRAM: say when that leaves the cache short of the expert set
         // (experts then swap in and out per token) or of half of what it would hold without them.
         if (slot_kv_cuda0 > 0) {
-            int64_t without = ((int64_t) free_b + (int64_t) slot_kv_cuda0 - reserve) / blob;
+            int64_t without = ((int64_t) plan_free + (int64_t) slot_kv_cuda0 - reserve) / blob;
             if (!profile.empty()) without = std::min<int64_t>(without, (int64_t) profile.size());
             const bool swaps = !profile.empty() && o.expert_cache < (int64_t) profile.size() && without >= (int64_t) profile.size();
             if (without > 0 && (swaps || o.expert_cache * 2 < without))
@@ -3199,10 +3230,10 @@ int main(int argc, char** argv) {
             ? ((int64_t) basalt::prefill::Prefill::bytes_needed(g, ss, 256) + blob - 1) / blob + 128 : 1;
         if (o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > kSmallReserveMib) {
             // the largest reserve (in MiB) that still leaves min_slots
-            const int64_t fit_mib = ((int64_t) free_b - mtp_bind - late_b - min_slots * blob) / (1 << 20) - prefill_mib;
+            const int64_t fit_mib = ((int64_t) plan_free - mtp_bind - late_b - min_slots * blob) / (1 << 20) - prefill_mib;
             if (fit_mib >= kSmallReserveMib) {
                 const int r = (int) std::min<int64_t>(fit_mib, o.vram_reserve_mib);
-                int64_t s2 = ((int64_t) free_b - ((((int64_t) r + prefill_mib) << 20) + mtp_bind + late_b)) / blob;
+                int64_t s2 = ((int64_t) plan_free - ((((int64_t) r + prefill_mib) << 20) + mtp_bind + late_b)) / blob;
                 if (!profile.empty()) s2 = std::min<int64_t>(s2, (int64_t) profile.size());
                 basalt::log::warn("basalt generate", "expert cache auto: the %d MiB reserve leaves too few slots on "
                                      "this card (a working cache needs %lld): a %d MiB reserve instead -> %lld slots",
@@ -3216,7 +3247,7 @@ int main(int argc, char** argv) {
             const int64_t at_reserve = o.vram_reserve_given ? o.vram_reserve_mib
                                                             : std::min(o.vram_reserve_mib, kSmallReserveMib);
             const int64_t need_b = (((int64_t) at_reserve + prefill_mib) << 20) + mtp_bind + late_b + min_slots * blob;
-            const int64_t short_mib = std::max<int64_t>(1, (need_b - (int64_t) free_b + (1 << 20) - 1) >> 20);
+            const int64_t short_mib = std::max<int64_t>(1, (need_b - (int64_t) plan_free + (1 << 20) - 1) >> 20);
             const int64_t session_mib =
                 (int64_t) (basalt::core::session_bytes(g, o.max_context, K, 0, g.n_layers) >> 20);
             const std::string reserve_tip =
@@ -3225,7 +3256,7 @@ int main(int argc, char** argv) {
                           std::to_string(kSmallReserveMib) + " is enough on a small card)"
                     : std::string();
             basalt::log::error("basalt generate", "no VRAM is left for the expert cache: it needs at least %lld slots "
-                                 "(%lld MiB), about %lld MiB more than this card has free. To make room: a smaller "
+                                 "(%lld MiB), about %lld MiB more than this plan has free. To make room: a smaller "
                                  "--max-context (the session, mostly its KV cache, takes %lld MiB at %lld tokens), "
                                  "--kv q4_0, a smaller draft vocabulary (the draft head takes "
                                  "%lld MiB now)%s, images on the CPU, or close other programs that use the GPU%s",
