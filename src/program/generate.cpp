@@ -3489,6 +3489,8 @@ int main(int argc, char** argv) {
     basalt::core::ReportFacts::ReadArm report_reads_after;       // one measurement, reused by every reprint
     basalt::core::ReportFacts::ReadArm report_reads_held_view;   // the confound-free arm, measured with it
     bool report_reads_after_done = false;
+    basalt::platform::ViewFaultProbe report_view_faults;         // what the prefetch hint buys, measured once
+    bool report_view_faults_done = false;
     auto mem_report = [&]() {
         report_facts.tier_known = true;
         report_facts.tier_bytes = (uint64_t) std::max<int64_t>(xcache.valid() ? xcache.bytes() : 0, 0);
@@ -3513,6 +3515,14 @@ int main(int argc, char** argv) {
         }
         report_facts.reads_after = report_reads_after;
         report_facts.reads_held_view = report_reads_held_view;
+        if (!report_view_faults_done) {
+            // What the prefetch hint buys when a view is faulted: windows over parts of the file that were never read
+            // through a view, three arms rotated through each round so none is always the colder one.  The third arm
+            // hints and then waits, which is what the expert tier's read-ahead actually gives the hint.
+            report_view_faults = basalt::platform::probe_view_faults(o.model, 64ull << 20, 3, 2);
+            report_view_faults_done = true;
+        }
+        report_facts.view_faults = report_view_faults;
         basalt::core::print_memory_report(report_facts);
     };
     if (basalt::core::diagnostics().memory_report) mem_report();

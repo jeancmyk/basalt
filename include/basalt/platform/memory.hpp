@@ -226,6 +226,33 @@ struct LargePageProbe {
 /// return, so this only measures. It is a probe, not an allocation: the answer describes this moment.
 LargePageProbe probe_large_pages(uint64_t want);
 
+/// What faulting a mapped view costs, with and without the OS prefetch hint.
+struct ViewFaultProbe {
+    bool ok = false;
+    uint64_t window_bytes = 0;     ///< bytes touched per measurement
+    uint32_t windows_per_arm = 0;  ///< how many windows each arm averaged over
+    /// Touch the window, no hint.
+    double off_seconds = 0, off_min = 0, off_max = 0;
+    /// Hint the window, then touch it: the hint is inside the timed region, because its cost is part of the answer.
+    double on_seconds = 0, on_min = 0, on_max = 0;
+    /// Hint the window, wait `wait_ms`, then touch it: the wait is not timed, so this is what the hint buys when it
+    /// has time to land before the pages are needed.
+    double early_seconds = 0, early_min = 0, early_max = 0;
+    double wait_ms = 0;
+    std::string error;
+    double off_ms_per_mib() const;
+    double on_ms_per_mib() const;
+    double early_ms_per_mib() const;
+};
+/// Time faulting `window_bytes` of `path` through a read-only view, three ways: a window touched with no hint, a
+/// window the OS is asked to prefetch (advise_willneed) immediately before it is touched, and a window hinted and
+/// then touched after `wait_ms` of unrelated waiting. Each measurement maps the file afresh and unmaps it afterwards,
+/// and every window is distinct and was never read through a view before. The arms rotate through the round's
+/// windows, so none is always the colder one.
+/// The faults are not necessarily disk reads: if the file's pages are already in the system cache the cost measured
+/// is the mapping and fault path. The rate says which - memory speed against drive speed.
+ViewFaultProbe probe_view_faults(const std::string& path, uint64_t window_bytes, uint32_t rounds, uint32_t wait_ms);
+
 /// Asks the OS to start bringing [p, p + bytes) of a mapped file view into memory, without waiting for the access.
 /// A hint, never an error: the system skips what it will not prefetch and says nothing about it, and without the
 /// hint the pages still arrive - one fault at a time, where they are touched.  The range is asked for in 128 KiB
