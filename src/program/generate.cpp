@@ -7824,10 +7824,17 @@ int main(int argc, char** argv) {
             }
             if (basalt::kernels::cvec().loaded()) basalt::kernels::cvec_set_enabled(want_cvec);
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
-            // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
-            checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
-                             return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
-                         }), checks.end());
+            // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new.  The
+            // a dropped checkpoint must give its GDN slot back, and the pool holds two, so a leak would stop
+            // any later checkpoint from ever taking one.
+            {
+                std::vector<size_t> victims;
+                for (size_t i = 0; i < checks.size(); ++i)
+                    if ((int64_t) checks[i].ids.size() > resume || !starts_with(checks[i].ids, checks[i].imgs))
+                        victims.push_back(i);
+                for (size_t i : victims) basalt::core::gdn_slot_detach(g_gdn_slots.book(), checks[i]);
+                for (size_t n = victims.size(); n-- > 0;) checks.erase(checks.begin() + (std::ptrdiff_t) victims[n]);
+            }
             live_ok = false;   // until this request has finished, the session is in between
             if (resume == 0) {
                 basalt::core::session_zero(*rsp, g, nullptr, main_cs);
