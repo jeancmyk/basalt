@@ -183,11 +183,47 @@ inline bool file_cache_keeps(uint64_t avail, uint64_t arena_bytes, uint64_t read
 
 /// Whether `advise_willneed` asks the OS for anything: it does on both platforms.
 bool read_ahead_enabled();
+
+/// One adapter's video memory, per segment group, as the display driver reports it. This is the budget the driver
+/// plans against: an allocation past the local one is placed in system memory instead of failing, so a plan that
+/// ignores it cannot tell a resident tier from a spilled one. `ok` is false when the query could not run (no
+/// adapter, no IDXGIAdapter3, or a platform without DXGI). `outputs` is -1 when the enumeration failed - which is
+/// "unknown", not "no outputs": a session with no desktop cannot enumerate, and reading that as zero would size a
+/// full budget on a machine that is driving a display.
+struct DxgiMemory {
+    bool ok = false;
+    uint64_t local_budget = 0;
+    uint64_t local_usage = 0;
+    uint64_t non_local_budget = 0;
+    uint64_t non_local_usage = 0;
+    int outputs = -1;
+};
+/// The figures for the adapter whose LUID matches `luid` (the 8 bytes of `cudaDeviceProp::luid`), or for the first
+/// adapter when `luid` is null.
+DxgiMemory dxgi_memory(const void* luid = nullptr);
+
 /// Print DXGI video-memory budget/usage for the default adapter (Windows; no-op elsewhere).
 void print_dxgi_memory_report();
 /// DXGI shared (non-local) memory budget in bytes for the adapter whose LUID matches `luid` (8 bytes),
 /// or 0 when unknown/unavailable. NULL `luid` queries the first adapter.
 uint64_t dxgi_non_local_budget(const void* luid);
+
+/// Enable `SeLockMemoryPrivilege` in this process's token, which `MEM_LARGE_PAGES` needs. The account having the
+/// right assigned is not enough: a privilege is absent from the token until the process asks for it. False when the
+/// token could not be adjusted, which the callers report and fall back from.
+bool enable_lock_memory_privilege();
+
+/// How much of a large-page request the system's pool actually grants.
+struct LargePageProbe {
+    uint64_t minimum = 0;    ///< GetLargePageMinimum(): 0 when this system has no large pages at all
+    uint64_t requested = 0;  ///< the largest size asked for
+    uint64_t granted = 0;    ///< the largest size the pool granted, released again before returning
+    uint64_t error = 0;      ///< the OS error of the first refusal (0 when `requested` was granted)
+};
+/// Ask the pool for `want` bytes of large pages, halving down to a floor, to find the largest block it really
+/// grants: a pool that declines a whole arena may still fund part of one. Every grant is released before the
+/// return, so this only measures. It is a probe, not an allocation: the answer describes this moment.
+LargePageProbe probe_large_pages(uint64_t want);
 
 /// Asks the OS to start bringing [p, p + bytes) of a mapped file view into memory, without waiting for the access.
 /// A hint, never an error: the system skips what it will not prefetch and says nothing about it, and without the
