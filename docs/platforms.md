@@ -43,6 +43,15 @@ process code page UTF-8 and lifts the path length limit.
   the pinned slices are limited to the GPU's shared-memory budget: the adapter's DXGI non-local
   budget less 8 GiB of headroom where DXGI answers, and `RAM/2 - 8 GiB` when it does not. The
   start-up note says which one capped it and what was capped.
+  What the cap is worth is measurable, and the memory report measures it: it registers 1 GiB
+  pieces of touched host memory until the driver refuses one, then releases every piece. On the
+  machine this port was developed on the driver accepted 96,256 MiB and refused the next, against
+  `RAM/2` of 97,081 MiB and the formula's 88,889 MiB, so the formula is conservative by 7,366 MiB
+  and its 8 GiB of headroom is very nearly that margin. Two consequences worth knowing before
+  touching either cap: the shared budget there (154,562 MiB) puts the DXGI figure about 50 GiB
+  *above* the driver's real ceiling, so it bounds nothing and what stops the sliced pin is the
+  loop's own refusal; and because the arena (47,965 MiB) registers whole, the sliced path never
+  runs and both caps are inert. A change to a cap cannot be validated on such a machine.
 - Large pages need the "Lock pages in memory" privilege, and locking the resident expert copy
   needs "Increase a process working set". Grant both under Local Security Policy, User Rights
   Assignment. Without them the engine falls back to 4 KiB pages and says so at start-up. A grant
