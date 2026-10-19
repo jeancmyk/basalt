@@ -1,5 +1,6 @@
 #include "basalt/core/conversation_cache.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -376,6 +377,37 @@ int main() {
         for (int64_t n : {int64_t(2), int64_t(3), int64_t(128), int64_t(129), int64_t(100000)})
             check(draft_cells(n) == n - 1, "a key of N tokens names N - 1 draft cells");
         check(draft_cells(-1) == 0, "a negative token count names no draft cell");
+    }
+    {
+        // A/B for the bulk key compare: the linear scan against the galloping one on a long agentic prefix, CPU-only.
+        // Printed for the ledger, not a gate.
+        static volatile size_t sink = 0;   // keeps a timed compare from being optimized away
+        auto fill = [](size_t tokens, bool differ_last) {
+            std::vector<int32_t> v(tokens + 3);
+            for (size_t i = 0; i < v.size(); ++i) v[i] = (int32_t) ((i * 2654435761u) >> 11);
+            if (differ_last) v[tokens - 1] = (int32_t) (v[tokens - 1] + 1);
+            return v;
+        };
+        auto per_call_us = [](auto&& fn, size_t rounds) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (size_t r = 0; r < rounds; ++r) sink += fn();
+            const auto t1 = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::micro>(t1 - t0).count() / (double) rounds;
+        };
+        for (size_t tokens : {size_t(32768), size_t(131072)}) {
+            const std::vector<int32_t> key = fill(tokens, false);
+            const size_t rounds = tokens > 32768 ? 100 : 200;
+            for (bool late : {false, true}) {
+                const std::vector<int32_t> prompt = fill(tokens, late);
+                const double linear =
+                        per_call_us([&] { return conversation_ids_equal_linear(key.data(), tokens, prompt.data()); }, rounds);
+                const double gallop =
+                        per_call_us([&] { return conversation_ids_equal(key.data(), tokens, prompt.data()); }, rounds);
+                std::printf("cache prefix A/B: %zu tokens, %s: linear %.1f us, galloping %.1f us (%.2fx)\n", tokens,
+                            late ? "last token differs" : "full match", linear, gallop,
+                            gallop > 0.0 ? linear / gallop : 0.0);
+            }
+        }
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
