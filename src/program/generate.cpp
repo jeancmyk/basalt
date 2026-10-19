@@ -436,6 +436,8 @@ struct Options {
     /// runs one group while stage k+1 runs another).  1 = every slot in one window, stage after stage.
     int batch_groups = 1;
     std::string spec_oracle;
+    /// Diagnostic: the request's GDN recurrent state, written when it ends, for the per-token oracle comparison.
+    std::string dump_gdn;
     int spec_corrupt = 0;
     /// Names the model's draft layer when it has one (the file); empty means no drafter.
     std::string mtp;
@@ -1349,6 +1351,7 @@ int main(int argc, char** argv) {
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
         else if (a == "--batch-groups") o.batch_groups = std::atoi(next("--batch-groups"));
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
+        else if (a == "--dump-gdn") o.dump_gdn = next("--dump-gdn");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--adapt-every") { o.adapt_every = std::atoi(next("--adapt-every")); o.adapt_every_given = true; }
@@ -8743,6 +8746,20 @@ int main(int argc, char** argv) {
             if (!ver.wait_commit(err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
+            }
+            if (!o.dump_gdn.empty()) {   // the recurrent state as this request left it, for the per-token oracle
+                const size_t bytes = conv_state_sizes(g, *rsp).gdn;
+                std::vector<uint8_t> host(bytes);
+                std::FILE* f = bytes ? std::fopen(o.dump_gdn.c_str(), "wb") : nullptr;
+                if (f != nullptr && cudaMemcpy(host.data(), rsp->gdn_state, bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                    std::fwrite(host.data(), 1, bytes, f) == bytes) {
+                    std::fclose(f);
+                    std::fprintf(stderr, "basalt serve: GDN state dumped: %zu bytes after %zu tokens -> %s\n", bytes,
+                                 consumed.size(), o.dump_gdn.c_str());
+                } else {
+                    if (f != nullptr) std::fclose(f);
+                    std::fprintf(stderr, "basalt serve: GDN state dump failed: %s\n", o.dump_gdn.c_str());
+                }
             }
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
