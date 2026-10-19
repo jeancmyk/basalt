@@ -408,6 +408,25 @@ int main() {
         ConversationCheckpoint none;   // never slotted: detaching is a no-op
         gdn_slot_detach(b, none);
         check(none.gdn_slot == -1 && b.used() == 0, "a checkpoint without a slot detaches to nothing");
+        // A chain dropped for a shorter resume must give its slots back: the pool holds two, so a leak on this path
+        // would leave every later checkpoint on host bytes for the rest of the process.  This is the serve loop's
+        // victim rule (ids longer than the resume point, or no longer a prefix of the prompt) applied to a chain.
+        GdnSlotBook pool;
+        pool.reset(2);
+        std::vector<ConversationCheckpoint> chain(4);
+        for (size_t i = 0; i < chain.size(); ++i) chain[i].ids.assign(i + 1, (int32_t) (i + 10));
+        chain[0].gdn_slot = pool.take((int64_t) chain[0].ids.size());
+        chain[1].gdn_slot = pool.take((int64_t) chain[1].ids.size());
+        check(pool.free() == 0 && pool.used() == 2, "two chain checkpoints hold both slots");
+        const int64_t resume = 1;   // the request resumes shorter than everything the chain holds
+        std::vector<size_t> victims;
+        for (size_t i = 0; i < chain.size(); ++i)
+            if ((int64_t) chain[i].ids.size() > resume) victims.push_back(i);
+        for (size_t i : victims) gdn_slot_detach(pool, chain[i]);
+        for (size_t n = victims.size(); n-- > 0;) chain.erase(chain.begin() + (std::ptrdiff_t) victims[n]);
+        check(chain.empty() && victims.size() == 4, "the shorter resume drops the whole chain");
+        check(pool.free() == 2 && pool.used() == 0, "dropping the chain returns every slot to the pool");
+        check(pool.take(9) >= 0, "a later checkpoint can still take a slot after the drop");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
