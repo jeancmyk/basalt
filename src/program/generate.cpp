@@ -1041,6 +1041,34 @@ uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry&
 /// device instead of over the host.  One pool per process; the serve loop is its only writer.
 basalt::core::GdnSlots g_gdn_slots;
 
+/// --dump-gdn: the base name for the byte-exact pair written beside a slot copy, and the GDN byte count a slot holds.
+std::string g_gdn_dump_base;
+size_t g_gdn_dump_bytes = 0;
+
+/// Writes `<base>.slot` and `<base>.state` for one slot copy: the two buffers a save or a restore has just made equal.
+/// Called immediately after the copy and with nothing in between, so equal files are the whole claim and any byte that
+/// differs is a defect in the pool.  Reads only; never advances either buffer.
+void gdn_dump_pair(const char* tag, const void* slot, const void* state, size_t bytes) {
+    if (g_gdn_dump_base.empty() || slot == nullptr || state == nullptr || bytes == 0) return;
+    std::vector<uint8_t> host(bytes);
+    const std::pair<const char*, const void*> halves[2] = {{".slot", slot}, {".state", state}};
+    for (const auto& half : halves) {
+        const std::string path = g_gdn_dump_base + half.first;
+        std::FILE* f = nullptr;
+        if (cudaMemcpy(host.data(), half.second, bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+            (f = std::fopen(path.c_str(), "wb")) != nullptr && std::fwrite(host.data(), 1, bytes, f) == bytes) {
+            std::fclose(f);
+            continue;
+        }
+        if (f != nullptr) std::fclose(f);
+        (void) cudaGetLastError();
+        std::fprintf(stderr, "basalt serve: GDN %s dump failed (%s)\n", tag, path.c_str());
+        return;
+    }
+    std::fprintf(stderr, "basalt serve: GDN %s: .slot and .state written beside %s (%zu bytes each)\n", tag,
+                 g_gdn_dump_base.c_str(), bytes);
+}
+
 /// Copies the running state out (this session's carve only).  The caller has synchronized the device.
 bool checkpoint_save(ConvCheckpoint& c, const basalt::core::SessionState& ss, const basalt::core::ModelGeometry& g) {
     std::string error;
@@ -1057,7 +1085,10 @@ bool checkpoint_restore(const ConvCheckpoint& c, basalt::core::SessionState& ss,
         const std::string where = c.gdn_slot >= 0 ? "slot " + std::to_string(c.gdn_slot) + " (D2D)" : "host bytes";
         std::fprintf(stderr, "basalt serve: checkpoint restore at %lld: %s\n", (long long) c.ids.size(), where.c_str());
     }
-    if (basalt::core::conversation_checkpoint_restore(c, ss, g, error, slot)) return true;
+    if (basalt::core::conversation_checkpoint_restore(c, ss, g, error, slot)) {
+        if (slot != nullptr) gdn_dump_pair("restore", slot, ss.gdn_state, g_gdn_dump_bytes);   // right after the copy
+        return true;
+    }
     std::fprintf(stderr, "basalt serve: checkpoint restore: %s\n", error.c_str());
     return false;
 }
@@ -5124,6 +5155,9 @@ int main(int argc, char** argv) {
                              se.empty() ? "no GDN layers, no device memory, or a layer split" : se.c_str());
             }
         }
+        // --dump-gdn: the per-request state file, plus the byte-exact pair each slot copy writes beside it
+        g_gdn_dump_base = o.dump_gdn;
+        g_gdn_dump_bytes = gdn_state_bytes;
         // finishes the in-flight host copy; a failed one drops its checkpoint
         auto ckd_finish = [&]() {
             const void* dst = ckd.pending();
@@ -5338,6 +5372,7 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     c.gdn_slot = slot;
+                    gdn_dump_pair("save", g_gdn_slots.ptr(slot), rsp->gdn_state, g_gdn_dump_bytes);   // right after
                 } else if (defer && stages.empty()) {
                     if (!ckd.save(c, *rsp, g, ce)) { std::fprintf(stderr, "basalt serve: checkpoint save: %s\n", ce.c_str()); return false; }
                 } else if (!checkpoint_save(c, *rsp, g)) return false;
