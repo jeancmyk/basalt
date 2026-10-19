@@ -140,6 +140,29 @@ inline uint64_t vram_free_for_plan(uint64_t device_free, bool budget_known, uint
     return left < device_free ? left : device_free;
 }
 
+/// The reserve a plan can fund: `want`, capped at `plan_free` when the budget makes it smaller, and never below
+/// `floor` - the stall floor is what keeps a request able to allocate - so a budget with nothing left yields the
+/// floor rather than a reserve of zero. `capped` (when given) reports whether `want` was reduced.
+inline uint64_t vram_reserve_for_plan(uint64_t want, uint64_t plan_free, uint64_t floor, bool* capped = nullptr) {
+    if (want <= plan_free) {
+        if (capped) *capped = false;
+        return want;
+    }
+    const uint64_t got = plan_free > floor ? plan_free : floor;
+    if (capped) *capped = got != want;
+    return got;
+}
+
+/// The same, for a plan that also needs `keep` bytes of its own: the cap stops `keep` short of the headroom so the
+/// reserve cannot take the room the plan was going to use. Without this a large reserve leaves the plan nothing, and
+/// a cache asked for by name becomes no cache at all rather than a small one. The floor still wins over `keep`: a
+/// reserve that cannot fund the stall floor is worse than a plan that is too small.
+inline uint64_t vram_reserve_for_plan_keeping(uint64_t want, uint64_t plan_free, uint64_t keep, uint64_t floor,
+                                              bool* capped = nullptr) {
+    const uint64_t room = plan_free > keep ? plan_free - keep : 0;
+    return vram_reserve_for_plan(want, room > floor ? room : floor, floor, capped);
+}
+
 /// The bytes of an allocation the driver did not take from device memory: `allocated` less how far the device's free
 /// figure actually fell. An allocation the driver placed partly in system memory lowers free by LESS than it asked
 /// for and does not fail, so that difference is the only sign of it. `tolerance` covers the allocator's bookkeeping
@@ -200,6 +223,10 @@ struct DxgiMemory {
 /// The figures for the adapter whose LUID matches `luid` (the 8 bytes of `cudaDeviceProp::luid`), or for the first
 /// adapter when `luid` is null.
 DxgiMemory dxgi_memory(const void* luid = nullptr);
+
+/// Whether the OS puts a per-process budget on video memory at all. Where it does not, the driver's own refusal is
+/// the only limit on a plan, and a line saying that budget is unavailable would be noise rather than information.
+bool budgets_video_memory();
 
 /// Print one adapter's video-memory budget and usage (both segment groups) and its output count, and return the same
 /// figures so a caller can compare a plan against them. `luid_matched` says whether `luid` named the device the plan
