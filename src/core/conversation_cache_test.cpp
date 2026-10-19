@@ -369,5 +369,13 @@ int main() {
             check(conversation_prefix(c, exact, {}) == 0, "a prompt as long as the key cannot consume its last token");
         }
     }
+    {
+        // The draft layer's key is a bigram sequence: a prefix of N tokens names N - 1 cells, and a prefix too short
+        // to hold a pair names none.
+        check(draft_cells(0) == 0 && draft_cells(1) == 0, "a key shorter than two tokens names no draft cell");
+        for (int64_t n : {int64_t(2), int64_t(3), int64_t(128), int64_t(129), int64_t(100000)})
+            check(draft_cells(n) == n - 1, "a key of N tokens names N - 1 draft cells");
+        check(draft_cells(-1) == 0, "a negative token count names no draft cell");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
