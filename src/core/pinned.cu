@@ -441,13 +441,13 @@ void print_memory_report(const ReportFacts& facts) {
                              "over the local budget by %llu MiB, so the driver can place that much in system memory\n",
                      (unsigned long long) (facts.tier_bytes >> 20), (unsigned long long) facts.tier_slots,
                      (unsigned long long) (facts.tier_full_bytes >> 20),
-                     (unsigned long long) (dx.local_usage - dx.local_budget));
+                     (unsigned long long) ((dx.local_usage - dx.local_budget) >> 20));
     } else {
         std::fprintf(stderr, "  tier: %llu MiB in %llu slots (full %llu MiB), charged to the LOCAL segment: within the "
                              "local budget, %llu MiB of headroom left\n",
                      (unsigned long long) (facts.tier_bytes >> 20), (unsigned long long) facts.tier_slots,
                      (unsigned long long) (facts.tier_full_bytes >> 20),
-                     (unsigned long long) (dx.local_budget - dx.local_usage));
+                     (unsigned long long) ((dx.local_budget - dx.local_usage) >> 20));
     }
     if (g_report_arena != nullptr && g_report_arena->registered_bytes > 0) {
         if (!dx.ok) {
@@ -458,12 +458,12 @@ void print_memory_report(const ReportFacts& facts) {
             std::fprintf(stderr, "  arena charge: %llu MiB registered, charged to the shared (NON_LOCAL) segment: usage "
                                  "is over the non-local budget by %llu MiB\n",
                          (unsigned long long) (g_report_arena->registered_bytes >> 20),
-                         (unsigned long long) (dx.non_local_usage - dx.non_local_budget));
+                         (unsigned long long) ((dx.non_local_usage - dx.non_local_budget) >> 20));
         } else {
             std::fprintf(stderr, "  arena charge: %llu MiB registered, charged to the shared (NON_LOCAL) segment: within "
                                  "the non-local budget, %llu MiB of headroom left\n",
                          (unsigned long long) (g_report_arena->registered_bytes >> 20),
-                         (unsigned long long) (dx.non_local_budget - dx.non_local_usage));
+                         (unsigned long long) ((dx.non_local_budget - dx.non_local_usage) >> 20));
         }
     }
     // The file readers' queue: a rate on its own cannot tell a slow drive from a queue that never went deep.
