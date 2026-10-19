@@ -3081,6 +3081,19 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    // THE READ-SHAPE ARM BEFORE THE EXPERT LOAD.  Nothing has mapped the model file yet - the weights were read,
+    // the PLE table either reads through its own unbuffered handle or holds a copy, and the expert tier is opened
+    // below.  The probe goes through platform::DirectFile, which opens without the file cache, so this arm cannot
+    // warm the later one and neither arm can be served from pages the other touched; it never reads the mapped
+    // view's pages, only its own buffers.  Two depths, so a deeper queue and a mapped view can be told apart.
+    // The label names the phase, not only the view: the two arms are far apart in time and the drive is in a
+    // different state, so an unlabelled pair reads as a contradiction.
+    basalt::core::ReportFacts::ReadArm report_reads_before;
+    report_reads_before.note = "before the expert load, no view of the model file";
+    if (basalt::core::diagnostics().memory_report) {
+        report_reads_before.shallow = basalt::platform::probe_reads(o.model, 4096, 32, 512);
+        report_reads_before.deep = basalt::platform::probe_reads(o.model, 4096, 256, 512);
+    }
     basalt::core::ArenaExpertSource arena_src;
     basalt::core::ExpertSource* srcp = nullptr;
     if (o.mmap_experts) {
@@ -3473,20 +3486,33 @@ int main(int argc, char** argv) {
     // --memory-report: nothing above or below pays for it otherwise, not even the probes, which are one-time and
     // cached so a later reprint does not measure again.
     basalt::core::ReportFacts report_facts;
-    basalt::platform::ReadProbe report_read_probe;   // one measurement, reused by every reprint
-    bool report_read_probe_done = false;
+    basalt::core::ReportFacts::ReadArm report_reads_after;       // one measurement, reused by every reprint
+    basalt::core::ReportFacts::ReadArm report_reads_held_view;   // the confound-free arm, measured with it
+    bool report_reads_after_done = false;
     auto mem_report = [&]() {
         report_facts.tier_known = true;
         report_facts.tier_bytes = (uint64_t) std::max<int64_t>(xcache.valid() ? xcache.bytes() : 0, 0);
         report_facts.tier_slots = (uint64_t) std::max<int64_t>(xcache.valid() ? xcache.slots() : 0, 0);
         report_facts.tier_full_bytes = (uint64_t) std::max<int64_t>(xcache.valid() ? xcache.full_bytes() : 0, 0);
         report_facts.ple_io = ple_table.io_report();
-        if (!report_read_probe_done) {
-            // The PLE path's contract: 4 KiB reads, several in flight.  Its own reader, so the live one is untouched.
-            report_read_probe = basalt::platform::probe_reads(o.model, 4096, 32, 512);
-            report_read_probe_done = true;
+        report_facts.reads_before = report_reads_before;
+        if (!report_reads_after_done) {
+            // The other arm: the same reads now that the run has loaded the experts.  With a mapped tier that is a
+            // view of this very file; with the default arena it is no view at all, and the label says which, because
+            // the two are different phases and their rates are not comparable to each other.
+            report_reads_after.note = o.mmap_experts ? "after the expert load, the tier's view of this file is mapped"
+                                                     : "after the expert load, no view of the model file";
+            report_reads_after.shallow = basalt::platform::probe_reads(o.model, 4096, 32, 512);
+            report_reads_after.deep = basalt::platform::probe_reads(o.model, 4096, 256, 512);
+            // The confound-free arm: the same phase and drive state as the one above, with a view of this file that
+            // the probe holds itself.  Only the mapping differs, so a difference between these two is the mapping's.
+            report_reads_held_view.note = "after the expert load, a view the probe holds itself";
+            report_reads_held_view.shallow = basalt::platform::probe_reads(o.model, 4096, 32, 512, /*hold_view=*/true);
+            report_reads_held_view.deep = basalt::platform::probe_reads(o.model, 4096, 256, 512, /*hold_view=*/true);
+            report_reads_after_done = true;
         }
-        report_facts.read_probe = report_read_probe;
+        report_facts.reads_after = report_reads_after;
+        report_facts.reads_held_view = report_reads_held_view;
         basalt::core::print_memory_report(report_facts);
     };
     if (basalt::core::diagnostics().memory_report) mem_report();

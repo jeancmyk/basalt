@@ -479,14 +479,23 @@ void print_memory_report(const ReportFacts& facts) {
             std::fprintf(stderr, "  probe h2d: not measured (no registered arena)\n");
         }
     }
-    if (facts.read_probe.ok) {
-        std::fprintf(stderr, "  probe reads: %u B x %llu at depth %u: %.0f reads/s, %.1f MiB/s, %llu failed\n",
-                     facts.read_probe.read_bytes, (unsigned long long) facts.read_probe.reads,
-                     facts.read_probe.depth, facts.read_probe.reads_per_s(),
-                     facts.read_probe.gib_per_s() * 1024.0, (unsigned long long) facts.read_probe.failed);
-    } else {
-        std::fprintf(stderr, "  probe reads: not measured%s%s\n", facts.read_probe.error.empty() ? "" : ": ",
-                     facts.read_probe.error.c_str());
+    // The small-read arms: the same file, size and count at two queue depths, measured once before any view of the
+    // file existed and once with whatever this run maps. An arm that could not run says so rather than reading as 0.
+    {
+        auto arm = [](const ReportFacts::ReadArm& a) {
+            for (const basalt::platform::ReadProbe* p : {&a.shallow, &a.deep}) {
+                if (p->ok)
+                    std::fprintf(stderr, "  probe reads (%s) %u B, depth %u: %.0f reads/s, %.1f MiB/s, %llu failed\n",
+                                 a.note.c_str(), p->read_bytes, p->depth, p->reads_per_s(),
+                                 p->gib_per_s() * 1024.0, (unsigned long long) p->failed);
+                else
+                    std::fprintf(stderr, "  probe reads (%s) depth %u: not measured%s%s\n", a.note.c_str(), p->depth,
+                                 p->error.empty() ? "" : ": ", p->error.c_str());
+            }
+        };
+        arm(facts.reads_before);
+        arm(facts.reads_after);
+        arm(facts.reads_held_view);
     }
 }
 

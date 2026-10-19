@@ -93,6 +93,10 @@ struct ReadProbe {
 /// The rate `reads` reads of `read_bytes` reach on `path`, issued `depth` at a time from a reader of its own (the
 /// callers' readers are untouched). Spread over the file, so this is the small-read contract and not a sequential
 /// rate. `ok` is false when the file could not be opened or the request is not one the contract allows.
-ReadProbe probe_reads(const std::string& path, uint32_t read_bytes, uint32_t depth, uint32_t reads);
+/// `hold_view`: map the whole file read-only for the duration of the timed run, the way the expert tier does, so the
+/// same reads can be measured with and without a mapped section of this file in this process. The mapping is made
+/// after the untimed batch and released before the return.
+ReadProbe probe_reads(const std::string& path, uint32_t read_bytes, uint32_t depth, uint32_t reads,
+                      bool hold_view = false);
 
 }  // namespace basalt::platform
