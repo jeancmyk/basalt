@@ -65,6 +65,12 @@ struct ThreadWaits {
 };
 ThreadWaits threads_in_disk_wait();
 
+/// Waits `ms` for something to change, as precisely and as cheaply as the OS allows: a thread's own high-resolution
+/// timer where there is one, the scheduler's sleep elsewhere. The timer belongs to the calling thread, so one
+/// waiter re-arming cannot move another's deadline, and the wait is bounded a little past `ms` so a signal that
+/// never arrives cannot hang the caller. For a short wait in a poll loop: it releases the core and the GPU.
+void wait_short(int ms);
+
 /// What a program writes to its standard output, run with `argv` (argv[0] found on PATH) and read to the end. With
 /// `include_stderr` its standard error is mixed in, otherwise it is thrown away. nullopt when the program cannot be
 /// started.
