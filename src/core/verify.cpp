@@ -8,6 +8,7 @@
 #include "basalt/core/gdn_head_split.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/platform/compiler.hpp"
+#include "basalt/platform/system.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -463,6 +464,10 @@ void dense_proj(int bit, int type, const void* w, const void* xq, float* y, int 
         kernels::native_mmvq(type, w, xq, y, n_in, n_out, n, s);
     }
 }
+// A short wait in a GPU wait loop: the platform's precise wait, which is a thread's own high-resolution timer
+// where there is one and the scheduler's sleep elsewhere.  Per-thread, so one waiter's re-arm cannot move
+// another's deadline; the wait is bounded.
+void wait_gpu_short() { basalt::platform::wait_short(1); }
 }  // namespace
 
 bool Verifier::release_gpu_waits(int timeout_ms) {
@@ -498,7 +503,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
             if (ms_since(t0) > timeout_ms) {
                 return false;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            wait_gpu_short();
         }
     }
     return true;
@@ -548,8 +553,9 @@ std::string Verifier::peer_released() {
     const OnDevice on(d->pdev);
     const Clock::time_point t0 = Clock::now();
     cudaError_t q;
-    while ((q = cudaStreamQuery(d->ps)) == cudaErrorNotReady && ms_since(t0) < 2000)
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    while ((q = cudaStreamQuery(d->ps)) == cudaErrorNotReady && ms_since(t0) < 2000) {
+        wait_gpu_short();
+    }
     if (q == cudaErrorNotReady) return "; the peer kernel still runs after the release";
     d->peer_live = false;
     for (DecMoe::XPeer& x : d->xp) {

@@ -8,9 +8,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
@@ -233,5 +235,24 @@ ThreadWaits threads_in_disk_wait() {
 }
 
 #endif
+
+void wait_short(int ms) {
+#if defined(_WIN32)
+    // The scheduler's interval timer is coarser than a millisecond; a thread's own high-resolution timer is not,
+    // and being per-thread, one waiter re-arming cannot move another's deadline. The timeout on the wait is the
+    // bound rather than the wait: it keeps a timer that never signals from hanging the loop that is polling.
+    static thread_local HANDLE timer =
+        CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (timer != nullptr) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG) ms * 10000LL;   // relative, in 100-ns units
+        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+            WaitForSingleObject(timer, (DWORD) ms + 1);
+            return;
+        }
+    }
+#endif
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
 
 }  // namespace basalt::platform
