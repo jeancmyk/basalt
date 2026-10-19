@@ -3535,7 +3535,12 @@ int main(int argc, char** argv) {
         // it is short of the reserve the cache is reopened smaller.
         int failed = 0;
         int zero_reads = 0;
+        // A shortfall under this is the allocator's bookkeeping and the rounding of two free readings, not a spill.
+        constexpr uint64_t kSpillTolerance = 32ull << 20;
+        int64_t spill_seen = 0;   // the last confirmed spill, so the line after the loop can name it
         for (int attempt = 0;; ++attempt) {
+            size_t free_before = 0, total_before = 0;
+            cudaMemGetInfo(&free_before, &total_before);   // what the tier has to come out of, for the spill check
             bool ok = false;
             {
                 ok = sized_slots.empty()
@@ -3560,19 +3565,43 @@ int main(int argc, char** argv) {
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
+            // A tier the driver placed partly in system memory lowers the free figure by less than it took, and
+            // nothing else would ever say so: this is the silent slowdown the budget check exists to prevent.
+            spill_seen = (int64_t) basalt::platform::spill_shortfall(free_before, free_b, (uint64_t) xcache.bytes(), kSpillTolerance);
+            if (spill_seen > 0) {
+                cudaMemGetInfo(&free_b, &total_b);   // a second reading, so a settling allocation is not read as a spill
+                spill_seen = (int64_t) basalt::platform::spill_shortfall(free_before, free_b, (uint64_t) xcache.bytes(), kSpillTolerance);
+            }
+            // --exp spill-force-mib=N pretends N MiB of the tier went to system memory, so the hand-back path can be
+            // exercised on a machine where nothing spills. A short-lived gate: it goes when the guard is trusted.
+            const double forced_spill_mib = basalt::core::exp_flag("spill-force-mib", 0.0);
+            if (forced_spill_mib > 0.0)
+                spill_seen = std::max<int64_t>(spill_seen, (int64_t) (forced_spill_mib * 1048576.0));
             const int64_t want = (int64_t) o.vram_reserve_mib << 20;
-            if ((int64_t) free_b >= want - (64ll << 20)) break;
+            const bool reserve_short = (int64_t) free_b < want - (64ll << 20);
+            if (!reserve_short && spill_seen == 0) break;
             // short by (want - free); a figure of 0 only says "at least": the first two such reads give back 1 GiB
             // each (the free figure read before the allocation can run high), later ones a quarter
-            int64_t give = want - (int64_t) free_b + (64ll << 20);
+            int64_t give = reserve_short ? want - (int64_t) free_b + (64ll << 20) : (64ll << 20);
             if (free_b < ((size_t) 16 << 20))
                 give = std::max<int64_t>(give, ++zero_reads <= 2 ? 1ll << 30 : xcache.bytes() / 4);
+            if (spill_seen > 0) give = std::max<int64_t>(give, spill_seen + (64ll << 20));
             const int64_t keep_bytes = xcache.bytes() - give;
-            std::fprintf(stderr, "basalt generate: only %lld MiB free once the slots are written (reserve %d MiB); "
-                                 "shrinking the expert cache\n", (long long) (free_b >> 20), o.vram_reserve_mib);
+            if (spill_seen > 0)
+                std::fprintf(stderr, "basalt generate: the expert cache did not come from device memory: %lld of %lld "
+                                     "MiB was placed in system memory; handing it back\n",
+                             (long long) (spill_seen >> 20), (long long) (xcache.bytes() >> 20));
+            else
+                std::fprintf(stderr, "basalt generate: only %lld MiB free once the slots are written (reserve %d MiB); "
+                                     "shrinking the expert cache\n", (long long) (free_b >> 20), o.vram_reserve_mib);
             xcache.close();
             if (!shrink_to(keep_bytes)) break;
         }
+        if (spill_seen > 0 && o.expert_cache > 0)
+            std::fprintf(stderr, "basalt warning: the expert cache may still be partly in system memory (%lld MiB did "
+                                 "not fit in device memory): it will be slow. The driver's sysmem fallback policy "
+                                 "(Prefer No Sysmem Fallback for this executable) turns that into a failed allocation "
+                                 "instead of a quiet slowdown\n", (long long) (spill_seen >> 20));
         if (failed > 0 && o.expert_cache > 0)
             std::fprintf(stderr, "basalt generate: expert cache: %d slots (%.2f GiB) after %d smaller tries - a bigger "
                                  "page file lets it use more of the free VRAM\n",

@@ -140,6 +140,19 @@ inline uint64_t vram_free_for_plan(uint64_t device_free, bool budget_known, uint
     return left < device_free ? left : device_free;
 }
 
+/// The bytes of an allocation the driver did not take from device memory: `allocated` less how far the device's free
+/// figure actually fell. An allocation the driver placed partly in system memory lowers free by LESS than it asked
+/// for and does not fail, so that difference is the only sign of it. `tolerance` covers the allocator's bookkeeping
+/// and the rounding of the reading; a shortfall past it is a spill. 0 when there is nothing to judge: free did not
+/// fall, or it fell by at least the allocation.
+inline uint64_t spill_shortfall(uint64_t free_before, uint64_t free_after, uint64_t allocated, uint64_t tolerance) {
+    if (free_before <= free_after || allocated == 0) return 0;
+    const uint64_t fell = free_before - free_after;
+    if (fell >= allocated) return 0;
+    const uint64_t missing = allocated - fell;
+    return missing > tolerance ? missing : 0;
+}
+
 /// Polls available_memory() until `stop_memory_watchdog`.  Below `floor_bytes` it prints a `basalt error:` line and
 /// _exit(1)s, so a load that is exhausting RAM ends before the machine starts to swap.
 void start_memory_watchdog(uint64_t floor_bytes);

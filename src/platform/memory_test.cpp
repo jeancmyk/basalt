@@ -227,6 +227,31 @@ int vram_plan_cases() {
     }
     return fail;
 }
+// The spill check: an allocation the driver placed partly in system memory lowers the free figure by less than it
+// asked for. Only a shortfall past the tolerance is a spill; a free figure that did not fall says nothing at all.
+int spill_cases() {
+    using basalt::platform::spill_shortfall;
+    const uint64_t tol = 32ull << 20;
+    struct Case { const char* what; double before, after, allocated, want; };
+    const Case cases[] = {
+        {"free fell by exactly the allocation", 100.0, 70.0, 30.0, 0.0},
+        {"free fell by more than the allocation", 100.0, 60.0, 30.0, 0.0},
+        {"free unchanged: nothing to judge", 100.0, 100.0, 30.0, 0.0},
+        {"free rose: something else was freed", 100.0, 110.0, 30.0, 0.0},
+        {"shortfall inside the tolerance", 100.0, 70.5, 30.0, 0.0},
+        {"half of it placed in system memory", 200.0, 150.0, 100.0, 50.0},
+        {"a zero-byte allocation", 100.0, 90.0, 0.0, 0.0},
+    };
+    int fail = 0;
+    for (const Case& c : cases) {
+        const uint64_t got = spill_shortfall(gib(c.before), gib(c.after), gib(c.allocated), tol);
+        const bool ok = got == gib(c.want);
+        std::printf("spill %-58s -> %llu MiB%s\n", c.what, (unsigned long long) (got >> 20),
+                    ok ? "" : "   <-- WRONG");
+        fail |= !ok;
+    }
+    return fail;
+}
 // The DXGI figures the memory report and the tier check read: a query that ran must carry a budget, and an output
 // count is never a fake zero. A platform without DXGI (or a session that cannot see an adapter) reports not-ok,
 // which the callers read as unknown.
@@ -270,7 +295,7 @@ int large_page_cases() {
 
 int main() {
     int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases() | vram_plan_cases() |
-                     dxgi_cases() | large_page_cases();
+                     spill_cases() | dxgi_cases() | large_page_cases();
     bool reduced = false;
     const uint64_t bytes = lock_test_bytes(reduced);
     if (bytes == 0) {
@@ -281,8 +306,6 @@ int main() {
     if (reduced)
         std::printf("lock_resident: the 256 MiB case is SKIPPED, the locked-memory limit is lower; locking %llu KiB instead\n",
                     (unsigned long long) (bytes >> 10));
-    int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases() | vram_plan_cases() |
-                     dxgi_cases() | large_page_cases();
     void* p = std::malloc(bytes);
     if (p == nullptr) return 2;
     std::memset(p, 1, bytes);
