@@ -212,9 +212,18 @@ struct SavedConversation {
 /// model's residual at position i with the token at i + 1, so its key is a bigram sequence: N tokens are N - 1
 /// bigrams, and a key of N tokens names cells [0, N - 1).  Cell N - 1 pairs with the token at N, which the key does
 /// not contain: it belongs to the next slice and shares this slice's boundary token.  Cached draft-path K/V is keyed
-/// by this count, never by the token count, and the cells it does not name are saved zeroed, so no reuse reads a
-/// pair from another turn.
+/// by this count, never by the token count; what a key may publish is `draft_published_cells` below.
 inline int64_t draft_cells(int64_t tokens) { return tokens > 0 ? tokens - 1 : 0; }
+
+/// Cells of the draft layer a token-prefix key may PUBLISH: `draft_cells(tokens)` rounded down to whole pages.  The
+/// boundary cell sits inside the page that holds it, so a page-granular image cannot leave the cell out without
+/// leaving its page out; rounding down keeps that page outside the published range, and a restore invalidates the
+/// trailing pages it did not publish.  This is not floor(tokens/page)*page: the count derives from the cells the key
+/// names, so a page-aligned token count still publishes one page fewer.
+inline int64_t draft_published_cells(int64_t tokens, int64_t page) {
+    if (page <= 0) return draft_cells(tokens);
+    return draft_cells(tokens) / page * page;
+}
 
 /// Element-by-element token equality, any token width.  Every caller only asks "equal or not", so this is
 /// the shape the bulk path below has to agree with.

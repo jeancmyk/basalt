@@ -318,7 +318,11 @@ int main() {
             check(a.bytes()==conversation_kv_bytes(f.state,f.g,upto,index),"size estimate equals snapshot payload");
             f.fill(177);
             check(conversation_kv_save(b,f.state,f.g,upto,index,err),"save B");
-            check(upto==0 || !equal(a,b),"fixture changes state");
+            // A draft image publishes whole pages of the cells its key names, so a short prefix publishes nothing and
+            // two saves at the same prefix are both empty; that is the rule, not a fixture that failed to change.
+            const int64_t published = index ? upto : draft_published_cells(upto, a.page_size ? a.page_size : 1);
+            if (published == 0) check(a.k.empty() && b.k.empty(), "a prefix with no whole page publishes no cells");
+            else check(!equal(a,b),"fixture changes state");
             check(conversation_kv_restore(a,f.state,f.g,upto,index,err),"restore A over B");
             cuda_check(cudaDeviceSynchronize());
             check(conversation_kv_save(restored,f.state,f.g,upto,index,err),"read back restored A");
@@ -332,7 +336,9 @@ int main() {
             }
             if (mode==2 && upto>0) {
                 const auto s=qsa_real_shapes();
-                const int64_t b1=(upto+s.page_size-1)/s.page_size,b0=std::max<int64_t>(0,b1-f.state.n_slots);
+                // The image's own extent, never the token count: the draft publishes whole pages of the cells its key
+                // names, and a ring refill derived from `upto` would read a page the image does not have.
+                const int64_t b1=a.cells/a.page_size,b0=std::max<int64_t>(0,b1-f.state.n_slots);
                 const size_t block=kv_block_bytes(s,fmt)/2;
                 // Codes and scales are separate in INT8; check code bytes here.
                 const size_t code_block=fmt==kKvInt8 ? s.page_size*s.n_head_kv*s.head_dim : block;

@@ -38,7 +38,11 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
         error = "conversation snapshot: invalid K/V geometry";
         return false;
     }
-    const int64_t cells = ((upto + s.page_size - 1) / s.page_size) * s.page_size;
+    // The draft layer's image is the cells its key names, whole pages only: the page holding the boundary cell is not
+    // published, and a restore invalidates the pages it did not publish.  Everything else is page-rounded up, since
+    // its last page is entirely the key's own.
+    const int64_t cells = index ? ((upto + s.page_size - 1) / s.page_size) * s.page_size
+                                : draft_published_cells(upto, s.page_size);
     const size_t per = st.kv_q4 ? (size_t) basalt::kernels::kv_q4_bytes_per_head((int) g.head_dim)
                               : (size_t) g.head_dim * (int8_keys ? 1 : 2);
     // Include the moving spare row, not only completed blocks. The checkpoint
@@ -155,11 +159,18 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error) || !backed(st, l, error)) return false;
-    if (unchanged_tokens < 0 || unchanged_tokens > upto || unchanged_tokens > image.cells) {
+    // The retained prefix a caller claims is measured in TOKENS; an image's extent is measured in CELLS, and the two
+    // are the same number only for the main layers.  The draft's extent is whole pages of the cells its key names, so
+    // its claim is capped by the cells it actually holds - the tokens past its last published cell were never in it.
+    if (unchanged_tokens < 0 || unchanged_tokens > upto ||
+        (index && unchanged_tokens > image.cells)) {
         error = "conversation snapshot: invalid unchanged prefix";
         return false;
     }
-    const int64_t whole_cells = (unchanged_tokens / l.page_size) * l.page_size;
+    const int64_t unchanged = index ? unchanged_tokens
+                                    : std::min<int64_t>(draft_cells(unchanged_tokens),
+                                                        std::min<int64_t>(l.cells, image.cells));
+    const int64_t whole_cells = (unchanged / l.page_size) * l.page_size;
     image.format = l.format;
     image.cells = l.cells;
     image.heads = g.n_head_kv;
@@ -173,7 +184,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
         // pages/rows strictly before the first rewritten token remain identical.
-        const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / basalt::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
+        const size_t keep = i == 4 ? (index ? size_t(unchanged / basalt::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
         dst[i]->resize(sizes[i]);
@@ -223,9 +234,12 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     if (st.kv_mode == 2 && upto > 0) {
         auto shapes = basalt::kernels::qsa_real_shapes();
         shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
-        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
-        basalt::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
-                                        std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, nullptr);
+        // The image's own extent: the draft's is rounded down to the pages it publishes, so a refill of
+        // ceil(upto/page) pages would touch a page the image does not have.
+        const int64_t end = l.cells / l.page_size;
+        if (end > 0)
+            basalt::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
+                                             std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, nullptr);
     }
     const auto status = cudaGetLastError();
     if (status == cudaSuccess) return true;

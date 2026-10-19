@@ -1,5 +1,6 @@
 // src/core/mtp.cpp - see include/basalt/core/mtp.hpp.
 #include "basalt/core/mtp.hpp"
+#include "basalt/core/conversation_cache.hpp"   // draft_published_cells: the pages a draft K/V image publishes
 #include "basalt/core/verify.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
@@ -1229,9 +1230,13 @@ bool MtpDrafter::capture_cond(int T, int steps) {
 void MtpDrafter::kv_restore(int64_t upto) {
     const OnDevice on_device(device_);
     if (st_.kv_mode != 2 || upto <= 0) return;
-    // the ring's blocks below `upto`, from the host copy: a checkpoint resume may have left later cells in them
+    // The ring's blocks below `upto`, from the host copy: a checkpoint resume may have left later cells in them.
+    // Only the pages a draft image publishes are refilled; the page holding the boundary cell is not one of them, and
+    // refilling it would publish bytes no key names.
     const basalt::kernels::QsaShapes s = shapes_of(*g_);
-    const int64_t b1 = (upto + s.page_size - 1) / s.page_size, b0 = std::max<int64_t>(0, b1 - st_.n_slots);
+    const int64_t b1 = draft_published_cells(upto, s.page_size) / s.page_size;
+    if (b1 <= 0) return;
+    const int64_t b0 = std::max<int64_t>(0, b1 - st_.n_slots);
     basalt::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_), b0, b1, st_.n_slots, s, cs_);
     cudaStreamSynchronize(cs_);
 }
