@@ -99,7 +99,7 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
 /// Record the arena the memory report describes (may be null).  Called where the arena is created.
 void set_report_arena(PinnedArena* arena);
 
-/// What only the caller knows: the VRAM tier it planned and the read rate it measured. The report cannot query
+/// What only the caller knows: the VRAM tier it planned and the read rates it measured. The report cannot query
 /// either, so a fact the caller does not have prints as unknown rather than as a zero that reads like a measurement.
 struct ReportFacts {
     bool tier_known = false;                  ///< false: no tier was planned, so nothing is claimed about one
@@ -107,7 +107,17 @@ struct ReportFacts {
     uint64_t tier_slots = 0;                  ///< expert blobs in it
     uint64_t tier_full_bytes = 0;             ///< what it would hold at its full size
     std::string ple_io;                       ///< the PLE reader's own line, when it has one
-    basalt::platform::ReadProbe read_probe;   ///< the one-time small-read rate; `ok` false means it was not measured
+    /// The small-read probe as one arm of a comparison: the same file, size and count, measured at two queue depths
+    /// while `note` says what was true of the file. Two arms that differ only in whether a view of that file is
+    /// mapped are what tells a coherency cost apart from a queue that never went deep.
+    struct ReadArm {
+        std::string note;                      ///< what was true of the file when this arm ran
+        basalt::platform::ReadProbe shallow;   ///< depth 32
+        basalt::platform::ReadProbe deep;      ///< depth 256
+    };
+    ReadArm reads_before;                      ///< measured before any view of the file was created
+    ReadArm reads_after;                       ///< measured with whatever this run maps
+    ReadArm reads_held_view;                   ///< measured with a view the probe holds itself, for the comparison
 };
 
 /// Print the consolidated memory report to stderr: host RAM and commit headroom, the process, the arena, the VRAM
