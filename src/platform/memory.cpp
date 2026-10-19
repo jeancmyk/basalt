@@ -11,6 +11,7 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <vector>
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
 #include <malloc.h>   // _aligned_malloc, _aligned_free
@@ -31,8 +32,10 @@ namespace basalt::platform {
 namespace {
 /// Enables one privilege in this process's token. A privilege can be assigned to the account and still be absent
 /// from the token until the process asks for it, which is the normal state for an interactive one. False when the
-/// token could not be adjusted - including the case where the account has no such right, which the call fails
-/// silently on.
+/// token could not be adjusted.
+///
+/// The error is cleared BEFORE the call: AdjustTokenPrivileges sets it only for ERROR_NOT_ALL_ASSIGNED, so on full
+/// success the previous value stands and a stale error would make a working privilege look refused.
 bool enable_privilege(LPCWSTR name) {
     HANDLE tok = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) return false;
@@ -41,8 +44,9 @@ bool enable_privilege(LPCWSTR name) {
     tp.PrivilegeCount = 1;
     if (LookupPrivilegeValueW(nullptr, name, &tp.Privileges[0].Luid)) {
         tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        SetLastError(ERROR_SUCCESS);
         if (AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) != 0)
-            ok = GetLastError() == ERROR_SUCCESS;   // it "succeeds" with ERROR_NOT_ALL_ASSIGNED when the right is absent
+            ok = GetLastError() == ERROR_SUCCESS;   // ERROR_NOT_ALL_ASSIGNED when the account has no such right
     }
     CloseHandle(tok);
     return ok;
@@ -868,6 +872,109 @@ bool enable_lock_memory_privilege() {
 #else
     return false;
 #endif
+}
+
+LargePagePrivilege probe_large_page_privilege() {
+    LargePagePrivilege p;
+#if defined(_WIN32)
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &tok)) {
+        p.note = "OpenProcessToken failed (error " + std::to_string(GetLastError()) + ")";
+        return p;
+    }
+    // 1. Is SeLockMemoryPrivilege in the token at all, and is it enabled? This is the pair a 1314 has to be read
+    //    against: a privilege that is absent cannot be enabled by AdjustTokenPrivileges, and one that is present but
+    //    refused by the allocation is a different problem from one the account never had.
+    LUID luid{};
+    if (LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &luid)) {
+        p.looked_up = true;
+        DWORD need = 0;
+        (void) GetTokenInformation(tok, TokenPrivileges, nullptr, 0, &need);
+        if (need > 0) {
+            std::vector<uint8_t> buf(need);
+            if (GetTokenInformation(tok, TokenPrivileges, buf.data(), need, &need)) {
+                const TOKEN_PRIVILEGES* tp = (const TOKEN_PRIVILEGES*) buf.data();
+                for (DWORD i = 0; i < tp->PrivilegeCount; ++i) {
+                    if (tp->Privileges[i].Luid.LowPart == luid.LowPart &&
+                        tp->Privileges[i].Luid.HighPart == luid.HighPart) {
+                        p.present = true;
+                        p.enabled = (tp->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED) != 0;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // 2. Elevation and integrity: a UAC-filtered token at Medium integrity is the ordinary interactive case, and a
+    //    privilege that is present there can still be refused by the allocation.
+    {
+        TOKEN_ELEVATION el{};
+        DWORD n = 0;
+        if (GetTokenInformation(tok, TokenElevation, &el, sizeof el, &n)) p.elevated = el.TokenIsElevated != 0;
+    }
+    {
+        DWORD need = 0;
+        (void) GetTokenInformation(tok, TokenIntegrityLevel, nullptr, 0, &need);
+        if (need > 0) {
+            std::vector<uint8_t> buf(need);
+            if (GetTokenInformation(tok, TokenIntegrityLevel, buf.data(), need, &need)) {
+                const TOKEN_MANDATORY_LABEL* ml = (const TOKEN_MANDATORY_LABEL*) buf.data();
+                const DWORD* rid = (const DWORD*) GetSidSubAuthority(
+                    ml->Label.Sid, (DWORD) (GetSidSubAuthorityCount(ml->Label.Sid)[0] - 1));
+                if (rid != nullptr) p.integrity_rid = *rid;   // 0x1000 medium, 0x2000 high, 0x3000 system
+            }
+        }
+    }
+    // 3. Is Administrators present but deny-only? That is what a filtered token looks like, and it is the reason a
+    //    privilege can be listed and enabled while the allocation still refuses it.
+    {
+        DWORD need = 0;
+        (void) GetTokenInformation(tok, TokenGroups, nullptr, 0, &need);
+        if (need > 0) {
+            std::vector<uint8_t> buf(need);
+            if (GetTokenInformation(tok, TokenGroups, buf.data(), need, &need)) {
+                const TOKEN_GROUPS* tg = (const TOKEN_GROUPS*) buf.data();
+                PSID admins_sid = nullptr;
+                SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+                if (AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0,
+                                             0, 0, &admins_sid)) {
+                    for (DWORD i = 0; i < tg->GroupCount; ++i) {
+                        if (!EqualSid(tg->Groups[i].Sid, admins_sid)) continue;
+                        p.admin_group = true;
+                        p.admin_deny_only = (tg->Groups[i].Attributes & SE_GROUP_USE_FOR_DENY_ONLY) != 0;
+                        break;
+                    }
+                    FreeSid(admins_sid);
+                }
+            }
+        }
+    }
+    CloseHandle(tok);
+    // 4. The two allocation forms, each with its own error: the documented single call, and reserve-then-commit.
+    {
+        const SIZE_T two_mib = (SIZE_T) GetLargePageMinimum();
+        void* a = VirtualAlloc(nullptr, two_mib, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+        p.single_ok = a != nullptr;
+        p.single_error = a != nullptr ? 0 : (uint64_t) GetLastError();
+        if (a != nullptr) VirtualFree(a, 0, MEM_RELEASE);
+    }
+    {
+        const SIZE_T two_mib = (SIZE_T) GetLargePageMinimum();
+        void* b = VirtualAlloc(nullptr, two_mib, MEM_RESERVE, PAGE_READWRITE);
+        p.reserve_ok = b != nullptr;
+        p.reserve_error = b != nullptr ? 0 : (uint64_t) GetLastError();
+        if (b != nullptr) {
+            void* c = VirtualAlloc(b, two_mib, MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+            p.commit_ok = c != nullptr;
+            p.commit_error = c != nullptr ? 0 : (uint64_t) GetLastError();
+            VirtualFree(b, 0, MEM_RELEASE);
+        }
+    }
+    p.ok = true;
+#else
+    p.note = "not applicable on this platform";
+#endif
+    return p;
 }
 
 LargePageProbe probe_large_pages(uint64_t want) {
