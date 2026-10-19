@@ -354,10 +354,11 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
                                   unchanged, reused_bytes)) return false;
     // The draft layer's K/V is keyed by bigrams, not tokens: the key is the first `upto` tokens and the cells it
-    // names are [0, draft_cells(upto)).  Its boundary cell pairs with a token the key does not contain, and may not
-    // even have been computed when the output cap was reached, so that page is always re-copied.
-    if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
-                                       std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
+    // names are [0, draft_cells(upto)), published as whole pages only.  The page holding the boundary cell is never
+    // published, so the unchanged prefix needs no off-by-one refresh for the draft: every published cell was
+    // computed.  `conversation_kv_save` caps the prefix by the extent for that reason.
+    if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error, unchanged, reused_bytes))
+        return false;
     image = std::move(captured);
     return true;
 }

@@ -9,6 +9,7 @@
 #include <functional>
 #include <limits>
 #include <cstring>
+#include <map>
 #include <vector>
 
 #if defined(CONVERSATION_TEST_TRANSFERS)
@@ -67,14 +68,23 @@ struct Pools {
         st.idx_pooled = (float*) data[4].data(); st.idx_tail = (float*) data[5].data();
         st.idx_dead = (float*) data[6].data(); st.idx_block_pos = (int32_t*) data[7].data();
     }
-    ConversationKv image(const ModelGeometry& g, bool index) const {
+    /// The image a save produces for a `tokens`-token key: whole pages for the draft layer, the token count rounded up
+    /// otherwise.  Sizes follow the same layout, so a fixture cannot encode an extent the engine does not use.
+    ConversationKv image(const ModelGeometry& g, bool index, int64_t tokens = 9) const {
+        const auto s = basalt::kernels::qsa_real_shapes();
+        const size_t per = st.kv_q4 ? basalt::kernels::kv_q4_bytes_per_head((int) g.head_dim)
+                                    : (size_t) g.head_dim * (st.kv_int8 ? 1 : 2);
+        const int64_t cells = index ? ((tokens + s.page_size - 1) / s.page_size) * s.page_size
+                                    : draft_published_cells(tokens, s.page_size);
+        const int64_t pooled = index && tokens > 0 ? tokens / s.idx_block + 1 : 0;
+        const size_t scale_per = st.kv_int8 && !st.kv_q4 ? (size_t) (g.head_dim / 64) * 2 : 0;
         ConversationKv k;
-        k.format = qsa_kv_format(st); k.cells = 12; k.page_size = 4;
+        k.format = qsa_kv_format(st); k.cells = cells; k.page_size = s.page_size;
         k.heads = g.n_head_kv; k.head_dim = g.head_dim; k.idx_dim = g.idx_key_dim;
-        k.pooled_rows = index ? 3 : 0;
-        k.k.resize(data[0].size() / 8, 13); k.v = k.k;
-        k.k_scale.resize(data[2].size() / 8, 13); k.v_scale = k.k_scale;
-        k.pooled.resize(k.pooled_rows * g.idx_key_dim * 4, 13);
+        k.pooled_rows = pooled;
+        k.k.resize((size_t) cells * (size_t) g.n_head_kv * per, 13); k.v = k.k;
+        k.k_scale.resize((size_t) cells * (size_t) g.n_head_kv * scale_per, 13); k.v_scale = k.k_scale;
+        k.pooled.resize((size_t) pooled * (size_t) g.idx_key_dim * 4, 13);
         return k;
     }
 };
@@ -175,6 +185,42 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     check(!conversation_state_sizes(bad_geometry,z,error), "zero layer interval rejected before division");
     bad_geometry = g; bad_geometry.n_head_kv = std::numeric_limits<int64_t>::max();
     check(conversation_kv_bytes(draft.st,bad_geometry,9,false)==0, "KV byte overflow rejected");
+    {
+        // The draft image publishes the cells its key names, whole pages only: the page holding the boundary cell is
+        // not published. The main layers keep rounding up - their last page is entirely the key's own.  The byte
+        // count is a sum of buffers whose allocation rounds up, so it is compared across token counts that publish
+        // the SAME cells: equal there, and strictly larger for a larger extent, is exactly "the extent is the cells".
+        const int64_t page = basalt::kernels::qsa_real_shapes().page_size;
+        std::map<int64_t, size_t> by_cells;
+        for (int64_t n : {page - 1, page, page + 1, 2 * page, 2 * page + 1, 3 * page + 2, int64_t(45), int64_t(48),
+                          int64_t(49)}) {
+            if (n < 1 || n > draft.st.max_cells) continue;   // past the fixture's capacity is a different rule
+            const int64_t want_cells = draft_published_cells(n, page);
+            const size_t bytes = conversation_kv_bytes(draft.st, g, n, false);
+            check(want_cells == draft_cells(n) / page * page, "the draft publishes whole pages of the cells its key names");
+            const auto found = by_cells.find(want_cells);
+            if (found == by_cells.end()) {
+                // A prefix shorter than one page names fewer cells than a page holds, so it publishes nothing at all.
+                check(want_cells == 0 ? bytes == 0 : bytes > 0,
+                      "a published extent has an image and a short prefix has none");
+                by_cells.emplace(want_cells, bytes);
+            } else {
+                check(found->second == bytes,
+                      "two token counts that publish the same cells cost the same image");
+            }
+            check(conversation_kv_bytes(first.st, g, n, true) > 0, "a main layer still sizes its image by the token count");
+        }
+        check(by_cells.size() > 1, "the loop covers more than one published extent");
+        size_t previous = 0;
+        for (const auto& [cells, bytes] : by_cells) {
+            if (previous != 0) check(bytes > previous, "a larger published extent is a larger image");
+            previous = bytes;
+        }
+        // Past the state's capacity the extent is refused outright, whatever the token count: that is the backing
+        // rule, not the publishing rule, so it is asserted separately.
+        check(conversation_kv_bytes(draft.st, g, draft.st.max_cells + 1, false) == 0,
+              "an extent past the state's capacity has no image");
+    }
 #if defined(CONVERSATION_TEST_TRANSFERS)
     auto reset = [&] {
         for (auto* p : {&first,&last,&draft}) for (auto& bytes : p->data) std::fill(bytes.begin(),bytes.end(),0xa5);
