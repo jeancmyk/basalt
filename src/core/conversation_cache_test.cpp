@@ -1,4 +1,5 @@
 #include "basalt/core/conversation_cache.hpp"
+#include "basalt/core/gdn_slots.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -408,6 +409,47 @@ int main() {
                             gallop > 0.0 ? linear / gallop : 0.0);
             }
         }
+    }
+    {
+        // The GDN slot book: which slot holds which seqlen, and which are free.
+        GdnSlotBook b;
+        b.reset(2);
+        check(b.slots() == 2 && b.used() == 0, "two GDN slots, none holding a state");
+        const int x = b.take(40), y = b.take(41);
+        check(x >= 0 && y >= 0 && x != y && b.used() == 2, "two checkpoints take distinct slots");
+        check(b.seqlen(x) == 40 && b.seqlen(y) == 41, "each slot records the seqlen it holds");
+        check(b.take(42) == -1, "no slot while both are taken");
+        b.release(x);
+        check(b.used() == 1 && b.seqlen(x) == -1, "releasing a slot frees it");
+        check(b.take(42) == x, "the freed slot is handed out again");
+        b.release(y);
+        b.release(y);
+        check(b.used() == 1, "releasing twice frees once");
+        b.release(-1);
+        b.release(99);
+        check(b.used() == 1, "releasing an invalid slot is a no-op");
+        check(b.seqlen(-1) == -1 && b.seqlen(99) == -1, "an invalid slot holds nothing");
+        b.reset(0);
+        check(b.slots() == 0 && b.take(1) == -1, "no pool: no slot, and the caller keeps host bytes");
+        // A checkpoint copied out of the chain detaches: the slot goes back to the book and the checkpoint keeps its
+        // host bytes, so the image or the other chain never carries an index the pool may hand out again.
+        b.reset(1);
+        ConversationCheckpoint c;
+        c.gdn_slot = b.take(7);
+        c.gdn.assign(4, 9);
+        check(c.gdn_slot == 0 && b.seqlen(0) == 7, "a chain checkpoint holds a slot with its seqlen");
+        gdn_slot_detach(b.book(), c);
+        check(c.gdn_slot == -1 && b.used() == 0 && b.seqlen(0) == -1 && c.gdn.size() == 4,
+              "detaching returns the slot and leaves the host bytes in place");
+        check(b.take(7) == 0, "the detached slot is handed out again");
+        b.release(0);
+        c.gdn_slot = b.take(8);
+        gdn_slot_detach(b.book(), c);
+        gdn_slot_detach(b.book(), c);
+        check(b.used() == 0, "detaching twice frees once");
+        ConversationCheckpoint none;   // never slotted: detaching is a no-op
+        gdn_slot_detach(b.book(), none);
+        check(none.gdn_slot == -1 && b.used() == 0, "a checkpoint without a slot detaches to nothing");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
