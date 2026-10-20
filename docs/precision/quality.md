@@ -59,6 +59,29 @@ first 20 chunks read higher than the 100-chunk set (higher KLD and higher top-1 
 which uses 20 chunks, reads higher than the 100-chunk numbers; the 100-chunk numbers are the ones to compare. The one gap
 is UD-Q4_K_XL at 20 chunks (0.068 vs 0.0579), explained in the next section.
 
+### On the Windows build
+
+The same harness on the Windows build, against a base built on this machine from the published Q8_0 GGUF
+(`llama-perplexity --kl-divergence-base`, 512-token chunks). Tokenization yields 105 chunks and a base PPL of 3.2684: a
+different corpus cut from the 100-chunk reference above, so these rows read against each other rather than replacing
+those. GSQ-RCO IQ3_S, int8 KV, `--resident-experts`, expert tiers auto-sized (25,463 MiB; of the routed expert lookups
+during decode 58.9% hit VRAM and 41.1% were served from CPU), 575 W:
+
+| Window T | PPL | KLD mean | KLD median | KLD p99 | Same top-1 |
+|---|---|---|---|---|---|
+| 1 | 3.3543 | 0.15558 | 0.03448 | 1.811 | 87.32% |
+| 3 | 3.3545 | 0.15533 | 0.03452 | 1.784 | 87.33% |
+| 7 | 3.3549 | 0.15550 | 0.03446 | 1.799 | 87.34% |
+
+PPL standard error 0.0435 on each. KLD mean sits 0.0027 above the 100-chunk reference for this pack and top-1 0.17
+points above it, which is the distance a different corpus cut moves them by.
+
+The three runs are also the forced-window check, since they score the same 26,775 rows. Changing the window width moves
+the aggregate by less than the standard error, and row by row it leaves 86.77% of rows bit-identical at T=1 against T=3
+and 95.93% at T=3 against T=7, while the chosen token agrees on 99.75% and 99.87% of them. The rows that do move are
+consistent with the width sensitivity recorded in [index.md](index.md): the recurrence is bitwise per segment, but its
+inputs are window-shaped.
+
 ## Why Q8_0 against Q8_0 is not zero
 
 The Basalt Q8_0 pack scores KLD 0.0456 and top-1 95.6% (4 chunks, fp16 KV) against the stock llama.cpp Q8_0 base. This
