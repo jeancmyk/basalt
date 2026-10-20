@@ -50,8 +50,8 @@ Adaptive swaps must be **off** for any of this to mean anything: with them on, o
 tokens between runs, because the tier exchanges experts while it decodes.
 
 The quality gate is the check that decides whether such a divergence is acceptable, and it needs a KL-divergence base
-built by llama.cpp from a Q8_0 copy of the model. The Q8_0 pack is published, but no such base has been built on the
-machine these numbers were taken from, so the gate has not been run on the Windows build.
+built by llama.cpp from a Q8_0 copy of the model. That base has since been built on the Windows machine from the
+published Q8_0 GGUF, and the gate run there; the numbers are the Windows-build row in [quality.md](quality.md).
 
 Both programs read a flat expert section: 512 blobs of 1,382,400 bytes, the Q2_0 layout they were written for. A pack
 carries one in its `mtp/experts` section, which copies out unmodified, so the same bytes run on either build:
