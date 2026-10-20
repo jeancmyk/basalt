@@ -3,6 +3,7 @@
 #pragma once
 
 #include "basalt/core/conversation_buffer.hpp"
+#include "basalt/core/gdn_slot_book.hpp"
 
 #include <algorithm>
 #include <array>
@@ -87,9 +88,10 @@ struct ConversationCheckpoint {
     std::vector<ConversationImageKey> imgs;
     CheckpointBytes gdn, ple, tails, dead, block_pos;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
-    // A device slot mirroring `gdn` (GdnSlots): -1 when the pool had none free, and every reader falls back to the
-    // host bytes.  The slot holds a copy of the state, never the state itself.
-    int gdn_slot = -1;
+    // A device slot mirroring `gdn` (GdnSlotRef): while it holds one, `gdn` is empty and a restore reads the
+    // recurrence device to device.  A copy of a checkpoint holds none, so an image or another chain carries host
+    // bytes only, and a chain that is replaced or dropped gives its slots back by itself.
+    GdnSlotRef gdn_slot;
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;

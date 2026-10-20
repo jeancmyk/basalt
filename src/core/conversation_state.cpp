@@ -155,7 +155,7 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const Ses
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
     // A checkpoint keeps its recurrence in a device slot or in host bytes, never both.
-    if (c.gdn_slot >= 0 ? !c.gdn.empty() : c.gdn.size() != z.gdn)
+    if (c.gdn_slot.index() >= 0 ? !c.gdn.empty() : c.gdn.size() != z.gdn)
         return fail(error, "invalid checkpoint GDN state: a slot and host bytes are exclusive");
     if (c.ple.size() != (ss.ple_hist ? z.ple : 0) ||
         c.tails.size() != layers * z.tail || c.dead.size() != layers * z.dead ||
@@ -259,10 +259,10 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     // A slotted checkpoint restores device to device; the slot is a mirror, so it stays as it is for the next hit.
-    if (c.gdn_slot >= 0 && gdn_dev == nullptr)
+    if (c.gdn_slot.index() >= 0 && gdn_dev == nullptr)
         return fail(error, "a checkpoint's GDN slot was not resolved");
-    if (c.gdn_slot >= 0 ? !copy_kind(ss.gdn_state, gdn_dev, z.gdn, cudaMemcpyDeviceToDevice, error)
-                        : !copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error)) return false;
+    if (c.gdn_slot.index() >= 0 ? !copy_kind(ss.gdn_state, gdn_dev, z.gdn, cudaMemcpyDeviceToDevice, error)
+                                : !copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error)) return false;
     if (!copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
     for (size_t j = 0; j < owned_qsa(ss); ++j) {
         const auto& st = owned(ss, j);

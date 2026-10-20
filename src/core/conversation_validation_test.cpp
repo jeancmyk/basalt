@@ -272,13 +272,17 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
         // pins that the two agree - a short copy would leave a tail of the state uncompared.
         std::vector<uint8_t> state(zc.gdn, 0x11), slot(zc.gdn, 0x22);
         ss.gdn_state = (float*) state.data();
+        // The slot this checkpoint names belongs to a book, as the engine's does: the save and the restore read the
+        // buffer through the index, and the checkpoint stays the one that holds it.
+        GdnSlotBook pool;
+        pool.reset(1);
         ConversationCheckpoint c;
         c.ids = {1, 2};
-        c.gdn_slot = 0;
+        check(c.gdn_slot.acquire(pool, 2) && c.gdn_slot.index() == 0, "the fixture takes the pool's only slot");
         reset_copies();
         check_why(conversation_checkpoint_save(c, ss, g, error, slot.data()), "a slotted checkpoint saves");
         check(c.gdn.empty(), "a slotted checkpoint keeps no host copy of the recurrence");
-        check(c.gdn_slot == 0, "the save kept the slot it was given");
+        check(c.gdn_slot.index() == 0 && pool.used() == 1, "the save kept the slot it was given");
         check(d2d_copies == 1 && d2d_bytes == zc.gdn && copied_kind_bytes[cudaMemcpyDeviceToHost] == 0,
               "the GDN slot capture is one D2D copy of exactly the recurrence's bytes");
         check(!copy_kinds.empty() && copy_kinds[0] == cudaMemcpyDeviceToDevice, "the first slot copy is D2D");
