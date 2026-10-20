@@ -3456,9 +3456,14 @@ int main(int argc, char** argv) {
         // A shortfall under this is the allocator's bookkeeping and the rounding of two free readings, not a spill.
         constexpr uint64_t kSpillTolerance = 32ull << 20;
         int64_t spill_seen = 0;   // the last confirmed spill, so the line after the loop can name it
+        // Placing part of a device allocation in system memory is the driver's sysmem fallback, and the OS video-memory
+        // budgets are the seams that see it.  Where the platform sets no such budget, two free readings can drift for
+        // reasons that are not a spill, and a false positive would shrink a cache that does fit.
+        const bool probes_spill = basalt::platform::budgets_video_memory();
         for (int attempt = 0;; ++attempt) {
             size_t free_before = 0, total_before = 0;
-            cudaMemGetInfo(&free_before, &total_before);   // what the tier has to come out of, for the spill check
+            if (probes_spill)
+                cudaMemGetInfo(&free_before, &total_before);   // what the tier has to come out of, for the spill check
             bool ok = false;
             {
                 ok = sized_slots.empty()
@@ -3485,10 +3490,12 @@ int main(int argc, char** argv) {
             cudaMemGetInfo(&free_b, &total_b);
             // A tier the driver placed partly in system memory lowers the free figure by less than it took, and
             // nothing else would ever say so: this is the silent slowdown the budget check exists to prevent.
-            spill_seen = (int64_t) basalt::platform::spill_shortfall(free_before, free_b, (uint64_t) xcache.bytes(), kSpillTolerance);
-            if (spill_seen > 0) {
-                cudaMemGetInfo(&free_b, &total_b);   // a second reading, so a settling allocation is not read as a spill
+            if (probes_spill) {
                 spill_seen = (int64_t) basalt::platform::spill_shortfall(free_before, free_b, (uint64_t) xcache.bytes(), kSpillTolerance);
+                if (spill_seen > 0) {
+                    cudaMemGetInfo(&free_b, &total_b);   // a second reading, so a settling allocation is not read as a spill
+                    spill_seen = (int64_t) basalt::platform::spill_shortfall(free_before, free_b, (uint64_t) xcache.bytes(), kSpillTolerance);
+                }
             }
             const int64_t want = (int64_t) o.vram_reserve_mib << 20;
             const bool reserve_short = (int64_t) free_b < want - (64ll << 20);
