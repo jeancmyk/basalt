@@ -326,10 +326,13 @@ int dxgi_cases() {
 
 // The large-page probe must describe the pool without keeping anything: a grant is a multiple of the minimum and no
 // larger than the request, and a refusal names an error. Nothing here fails when the pool declines - that is an
-// answer, not a bug - so only the shape of the report is asserted.
+// answer, not a bug - so the shape of the report is asserted, and a grant is PROVED: the working-set query reads the
+// mapping's own pages back, and a commit that reports no large page among them is not the backing the call asked
+// for, whatever the OS said when it accepted the flag.
 int large_page_cases() {
     using namespace basalt::platform;
     const LargePageProbe p = probe_large_pages(30ull << 30);
+    const LargePagePrivilege pr = probe_large_page_privilege();
     if (p.minimum == 0) {
         std::printf("large pages %-50s -> none on this system\n", "30 GiB requested");
         return 0;
@@ -340,8 +343,21 @@ int large_page_cases() {
                 (unsigned long long) (p.minimum >> 20), (unsigned long long) (p.granted >> 20),
                 (unsigned long long) (p.requested >> 20), p.error != 0 ? ", refusal error " : "",
                 p.error != 0 ? std::to_string(p.error).c_str() : "");
+    // Single-call form (what the arena asks for): RESERVE|COMMIT|LARGE_PAGES in one call.  A grant that the mapping's
+    // own pages do not confirm is the defect this check exists for.
+    const bool single_proved = p.granted == 0 || p.sampled == 0 || p.large_pages > 0;
+    std::printf("large pages %-50s -> %llu of %llu sampled addresses flagged large%s\n", "one call, proved",
+                (unsigned long long) p.large_pages, (unsigned long long) p.sampled,
+                single_proved ? "" : "   <-- WRONG");
+    // The chunked form (reserve, then commit pieces into it), which the arena no longer uses: reported, because it is
+    // accepted here and backs its pages with 4 KB ones, and that is what made the single call the only form to keep.
+    std::printf("large pages %-50s -> commit %s, %llu of %llu sampled addresses flagged large%s\n",
+                "reserve then commit", pr.commit_ok ? "accepted" : "refused",
+                (unsigned long long) pr.commit_large, (unsigned long long) pr.commit_sampled,
+                (pr.commit_ok && pr.commit_sampled > 0 && pr.commit_large == 0)
+                    ? "   (accepted, but not large pages)" : "");
     if (!shape) std::printf("large pages %-50s   <-- WRONG\n", "shape");
-    return !(shape && explained);
+    return !(shape && explained && single_proved);
 }
 }  // namespace
 

@@ -52,6 +52,12 @@ void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const 
 /// Releases what `alloc_region` returned through `mapping_base` and `mapping_bytes`. A null is fine.
 void free_region(void* mapping_base, uint64_t mapping_bytes);
 
+/// What a region's own pages report about their backing, so `RegionBacking::LargePages` can be checked rather than
+/// taken on the allocation call's word.  Addresses spread over the region are faulted (the write is a zero byte, and
+/// the region is zero-filled where the OS commits it) and their backing read back: `sampled` counts the ones the OS
+/// described, `large` those described as large-page backed.  Both 0 when it described nothing: unknown, not a refusal.
+void region_page_backing(void* p, uint64_t bytes, uint64_t& sampled, uint64_t& large);
+
 /// The most host memory the GPU may map page-locked before its shared-memory segment is full, when the OS limits it
 /// beneath the driver's own refusal (`why` names where the figure comes from); false when it does not, and the driver's
 /// refusal is the limit.  `luid` is the 8 bytes of the device's LUID when the caller has one, which picks the adapter
@@ -260,6 +266,9 @@ struct LargePagePrivilege {
     uint64_t reserve_error = 0;
     bool commit_ok = false;       ///< MEM_COMMIT|MEM_LARGE_PAGES into that reservation
     uint64_t commit_error = 0;
+    // Whether the pages the chunked form got back ARE large pages, read from the mapping itself rather than inferred
+    // from the call succeeding: how many addresses the working-set query read back, and how many it flagged large.
+    uint64_t commit_sampled = 0, commit_large = 0;
     std::string note;             ///< why the probe could not run, when it could not
 };
 /// Read the token state and try the two allocation forms. Nothing is left allocated or adjusted: every region it
@@ -272,6 +281,10 @@ struct LargePageProbe {
     uint64_t requested = 0;  ///< the largest size asked for
     uint64_t granted = 0;    ///< the largest size the pool granted, released again before returning
     uint64_t error = 0;      ///< the OS error of the first refusal (0 when `requested` was granted)
+    // The grant proved from its own pages, measured while it was mapped: addresses the working-set query read back,
+    // and how many of those it flagged as large pages.  Both 0 when the query could not run, which is unknown
+    // rather than a refusal.
+    uint64_t sampled = 0, large_pages = 0;
 };
 /// Ask the pool for `want` bytes of large pages, halving down to a floor, to find the largest block it really
 /// grants: a pool that declines a whole arena may still fund part of one. Every grant is released before the

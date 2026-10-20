@@ -16,6 +16,7 @@
 #include "basalt/platform/win.hpp"
 #include <malloc.h>   // _aligned_malloc, _aligned_free
 #include <dxgi1_4.h>  // IDXGIAdapter3::QueryVideoMemoryInfo
+#include <psapi.h>    // QueryWorkingSetEx: the large-page flag of a mapping's own pages
 #else
 #include <fcntl.h>
 #include <linux/mman.h>   // MAP_HUGE_2MB
@@ -50,6 +51,35 @@ bool enable_privilege(LPCWSTR name) {
     }
     CloseHandle(tok);
     return ok;
+}
+
+/// What a committed range's own pages say about it.  A page reports its backing only once it is resident, so this
+/// writes a zero byte at a bounded number of addresses spread over the range - the range is committed zeroed, so the
+/// write cannot change it - and reads the flags back.  `sampled` counts the addresses the query answered for (0 when
+/// it could not run, which is unknown rather than a refusal) and `large` those it flagged as large pages.
+struct PageBacking {
+    uint64_t sampled = 0, large = 0;
+};
+PageBacking page_backing(void* p, uint64_t bytes, size_t samples = 16) {
+    PageBacking r;
+    constexpr uint64_t kPage = 4096;
+    if (p == nullptr || bytes < kPage || samples == 0) return r;
+    uint64_t stride = bytes / samples;
+    stride = (stride + kPage - 1) / kPage * kPage;
+    if (stride == 0) stride = kPage;
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info;
+    for (uint64_t off = 0; off < bytes; off += stride) {
+        uint8_t* const at = static_cast<uint8_t*>(p) + off;
+        *at = 0;   // fault the page in, then ask the OS what backs it
+        info.push_back(PSAPI_WORKING_SET_EX_INFORMATION{at});
+    }
+    if (!QueryWorkingSetEx(GetCurrentProcess(), info.data(), (DWORD) (info.size() * sizeof info[0]))) return r;
+    for (const PSAPI_WORKING_SET_EX_INFORMATION& e : info) {
+        if (!e.VirtualAttributes.Valid) continue;
+        ++r.sampled;
+        if (e.VirtualAttributes.LargePage) ++r.large;
+    }
+    return r;
 }
 }  // namespace
 #endif
@@ -446,48 +476,36 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
     if (large > 0) {
         // The requested size must be an exact multiple of the large-page minimum; the slack is under one page.
         const uint64_t lp_bytes = ((uint64_t) bytes + (uint64_t) large - 1) / (uint64_t) large * (uint64_t) large;
-        // CHUNKED, NOT ALL-OR-NOTHING.  The arena has to stay ONE contiguous range: layer bounds index into it, the
-        // registration covers it as a whole and the destructor releases it in one call.  So the range is reserved
-        // first and then filled piece by piece into that reservation, rather than each piece being its own
-        // allocation.  One all-or-nothing call cannot tell a pool merely smaller than the arena from an absent one,
-        // and it cannot say how far a partial pool would have got.  The chunk matches the commit chunk below, which
-        // keeps the syscall count in the tens for an arena of this size, and it is a multiple of the large-page
-        // minimum.
-        constexpr uint64_t kLargeChunk = 1ull << 30;
-        if (void* p = VirtualAlloc(nullptr, (SIZE_T) lp_bytes, MEM_RESERVE, PAGE_NOACCESS)) {
-            uint64_t off = 0, granted = 0, refused_at = 0;
-            DWORD first_error = 0;
-            for (; off < lp_bytes; off += kLargeChunk) {
-                const uint64_t n = lp_bytes - off < kLargeChunk ? lp_bytes - off : kLargeChunk;
-                if (VirtualAlloc((uint8_t*) p + off, (SIZE_T) n, MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE) == nullptr) {
-                    first_error = GetLastError();
-                    refused_at = off;
-                    break;
-                }
-                granted = off + n;
-            }
-            if (off >= lp_bytes) {
+        // ONE CALL, RESERVATION AND COMMIT TOGETHER.  MEM_LARGE_PAGES is honoured only when the reservation and the
+        // commit are the same call: committing a subrange of an existing reservation with the flag is ACCEPTED and
+        // hands back 4 KB pages, which is why the reserve-then-chunked-commit shape this used to have reported a
+        // large-page arena that never was one.  Whether a smaller pool would have fitted is a separate question, and
+        // the large-page probe answers it.
+        if (void* p = VirtualAlloc(nullptr, (SIZE_T) lp_bytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                                   PAGE_READWRITE)) {
+            // Read the backing off the mapping rather than trust the flag: an accepted call that gave small pages is
+            // the failure mode above, and it must not be reported as large pages.  A query that answered nothing is
+            // unknown rather than a refusal, so the accepted form stands in that case.
+            const PageBacking g = page_backing(p, lp_bytes);
+            if (g.sampled == 0 || g.large > 0) {
                 got = RegionBacking::LargePages;
-                note = "large pages (" + std::to_string((unsigned long long) large) + " B), " +
-                       std::to_string((lp_bytes + kLargeChunk - 1) / kLargeChunk) + " chunks of up to " +
-                       std::to_string(kLargeChunk >> 20) + " MiB";
+                note = "large pages (" + std::to_string((unsigned long long) large) + " B), one reserve-and-commit of " +
+                       std::to_string(lp_bytes >> 20) + " MiB, " +
+                       (g.sampled > 0 ? std::to_string(g.large) + " of " + std::to_string(g.sampled) +
+                                         " sampled addresses flagged large"
+                                      : "the working-set query read no address back");
                 return p;
             }
-            // ALL OR NOTHING: a half-converted arena would need a third backing state and would make the TLB
-            // reasoning ambiguous, so the whole reservation goes back and the arena falls back to ordinary pages.
-            // One release covers the committed chunks and the untouched reservation alike, because each chunk
-            // commit replaced a subrange of this same reservation.
             VirtualFree(p, 0, MEM_RELEASE);
-            // ERROR_NO_SYSTEM_RESOURCES is the page pool declining, ERROR_PRIVILEGE_NOT_HELD is the token and
-            // ERROR_INVALID_PARAMETER a size that is not a multiple of the minimum. They need different fixes, so
-            // the note carries the number, where the loop stopped and how much it had granted by then.
-            note = "large pages refused at " + gib_size(refused_at) + " of " + gib_size(lp_bytes) + ", granted " +
-                   gib_size(granted) + " in " + std::to_string((refused_at + kLargeChunk - 1) / kLargeChunk) +
-                   " chunks (GetLargePageMinimum=" + std::to_string((unsigned long long) large) +
-                   " B, VirtualAlloc error " + std::to_string((unsigned long long) first_error) + "); using 4 KB pages";
+            note = "large pages accepted but not given (" + std::to_string(g.sampled) +
+                   " addresses read back from the mapping, none flagged large); using 4 KB pages";
         } else {
-            note = "large pages: cannot reserve " + gib_size(lp_bytes) + " (VirtualAlloc error " +
-                   std::to_string((unsigned long long) GetLastError()) + "); using 4 KB pages";
+            // ERROR_NO_SYSTEM_RESOURCES is the page pool declining, ERROR_PRIVILEGE_NOT_HELD is the token and
+            // ERROR_INVALID_PARAMETER a size that is not a multiple of the minimum. They need different fixes, so the
+            // note carries the number; the probe's granted figure says whether the pool is merely smaller than this.
+            note = "large pages refused for " + gib_size(lp_bytes) + " (GetLargePageMinimum=" +
+                   std::to_string((unsigned long long) large) + " B, VirtualAlloc error " +
+                   std::to_string((unsigned long long) GetLastError()) + "); the probe says what the pool would grant";
         }
     } else {
         note = "this system has no large-page minimum; using 4 KB pages";
@@ -766,6 +784,31 @@ void free_region(void* p, uint64_t bytes) {
 bool pin_budget(uint64_t&, std::string&, const void*) { return false; }   // no OS-side budget below the driver's own limit
 #endif
 
+void region_page_backing(void* p, uint64_t bytes, uint64_t& sampled, uint64_t& large) {
+    sampled = 0;
+    large = 0;
+#if defined(_WIN32)
+    const PageBacking g = page_backing(p, bytes);
+    sampled = g.sampled;
+    large = g.large;
+#else
+    if (p == nullptr || bytes < 4096) return;
+    static_cast<uint8_t*>(p)[0] = 0;   // fault the first page, so the kernel describes the mapping at all
+    if (std::FILE* f = std::fopen("/proc/self/smaps", "r")) {
+        char line[512];
+        const unsigned long long addr = (unsigned long long) (uintptr_t) p;
+        unsigned long long lo = 0, hi = 0, page_kb = 0;
+        while (std::fgets(line, sizeof line, f)) {
+            unsigned long long s = 0, e = 0;
+            if (std::sscanf(line, "%llx-%llx", &s, &e) == 2) { lo = s; hi = e; page_kb = 0; continue; }
+            if (addr >= lo && addr < hi && std::sscanf(line, "PageSize: %llu kB", &page_kb) == 1) break;
+        }
+        std::fclose(f);
+        if (hi > lo) { sampled = 1; if (page_kb * 1024ull > 4096) large = 1; }
+    }
+#endif
+}
+
 void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
                    uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
     void* p = alloc_region_raw(bytes, got, note, shared_file, shared_hash, mapping_base, mapping_bytes);
@@ -967,6 +1010,11 @@ LargePagePrivilege probe_large_page_privilege() {
             void* c = VirtualAlloc(b, two_mib, MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
             p.commit_ok = c != nullptr;
             p.commit_error = c != nullptr ? 0 : (uint64_t) GetLastError();
+            if (c != nullptr) {   // the form the arena commits with: read its pages back before releasing them
+                const PageBacking g = page_backing(c, (uint64_t) two_mib);
+                p.commit_sampled = g.sampled;
+                p.commit_large = g.large;
+            }
             VirtualFree(b, 0, MEM_RELEASE);
         }
     }
@@ -988,6 +1036,9 @@ LargePageProbe probe_large_pages(uint64_t want) {
     for (uint64_t ask = want / p.minimum * p.minimum; ask >= floor; ask = ask / 2 / p.minimum * p.minimum) {
         void* got = VirtualAlloc(nullptr, (SIZE_T) ask, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
         if (got != nullptr) {
+            const PageBacking b = page_backing(got, ask);   // while it is still mapped
+            p.sampled = b.sampled;
+            p.large_pages = b.large;
             VirtualFree(got, 0, MEM_RELEASE);
             p.granted = ask;
             return p;

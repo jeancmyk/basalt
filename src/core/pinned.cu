@@ -440,9 +440,11 @@ void print_memory_report(const ReportFacts& facts) {
         if (lp.minimum == 0) {
             std::fprintf(stderr, "  large pages: none on this system\n");
         } else if (lp.granted > 0) {
-            std::fprintf(stderr, "  large pages: minimum %llu MiB, the pool grants %llu MiB of the %llu MiB requested\n",
+            std::fprintf(stderr, "  large pages: minimum %llu MiB, the pool grants %llu MiB of the %llu MiB requested"
+                                 " (%llu of %llu addresses of the grant read back as large pages)\n",
                          (unsigned long long) (lp.minimum >> 20), (unsigned long long) (lp.granted >> 20),
-                         (unsigned long long) (lp.requested >> 20));
+                         (unsigned long long) (lp.requested >> 20), (unsigned long long) lp.large_pages,
+                         (unsigned long long) lp.sampled);
         } else if (lp.error == 1314) {
             std::fprintf(stderr, "  large pages: minimum %llu MiB, the token does not hold the privilege (1314), so "
                                  "none of the %llu MiB requested was granted - the session's ceiling, not the pool's\n",

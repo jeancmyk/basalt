@@ -70,19 +70,18 @@ process code page UTF-8 and lifts the path length limit.
   memory report reads the token state back (`present`, `enabled`, elevation, integrity, whether
   Administrators is deny-only) and tries each allocation form, so one line settles what four
   guesses could not.
-  The large-page request is made in **1 GiB chunks into one reservation**, not as a single
-  all-or-nothing call, so a pool that is merely smaller than the arena can be told apart from one
-  that is absent. The arena has to stay one contiguous range - layer bounds index into it, the
-  registration covers it whole and the destructor releases it in one call - so the range is
-  reserved first and filled piece by piece; the chunk matches the ordinary commit chunk and is a
-  multiple of the 2 MiB page. The policy is **all large pages or all 4 KiB pages**: on the first
-  refused chunk the reservation goes back and the arena falls back whole, because a half-converted
-  arena would need a third backing state. The note says where the loop stopped and what it had
-  granted by then, so "pool exhausted part way" and "pool would not grant a single page" do not
-  read alike. The same shape applies to the Linux `MAP_HUGETLB` path, which is where the chunked
-  attempt is exercised against a real pool: there the reservation is `PROT_NONE`, the pieces are
-  `MAP_FIXED` over it, and the base is aligned up to 2 MiB by hand because the kernel only picks a
-  huge-page-aligned address when `addr` is NULL.
+   The large-page arena is requested **in one call on Windows and in 1 GiB chunks on Linux**, and the
+   difference is not stylistic: `VirtualAlloc` honours `MEM_LARGE_PAGES` only when the reservation and
+   the commit are the same call. Committing a subrange of an existing reservation with that flag is
+   *accepted* and hands back 4 KiB pages, so the chunked shape the Windows arm used to have reported a
+   large-page arena that never was one. The Linux `MAP_HUGETLB` path does fill one reservation piece by
+   piece, and there the pieces really are huge pages: the reservation is `PROT_NONE`, the pieces are
+   `MAP_FIXED` over it, and the base is aligned up to 2 MiB by hand because the kernel only picks a
+   huge-page-aligned address when `addr` is NULL. The policy is **all large pages or all 4 KiB pages** on
+   both, because a half-converted arena would need a third backing state. The arena reads its backing off
+   its own pages - a bounded number of addresses written to and then queried through the working-set API -
+   so a call succeeding is never by itself the claim that the pages are large. Whether a smaller pool would
+   have fitted is the memory report's large-page probe line's question, not the arena's.
 - Shared arena files and cgroup quotas do not exist. The engine refuses the first and reports no
   container limit.
 - `basalt serve` runs the Python server as a child and exits with its status; Linux replaces
