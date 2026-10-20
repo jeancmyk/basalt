@@ -5,7 +5,8 @@ The base is `llama-perplexity --kl-divergence-base`'s file (wikitext-2, 512-toke
 engine runs as `--serve` with the model plus --ppl-base and --ppl-out; per chunk it reads the first half as a prompt
 and teacher-forces the rest through verify windows of T tokens (see the engine's ppl_gate.hpp). Flags this tool does
 not know are passed to the engine as they are; it sets only what the measurement needs (--spec 5,
-no adaptive swaps, a second visible GPU as the peer tier), and an engine flag given here replaces that value.
+no adaptive swaps, a second visible GPU as the peer tier where the platform allows one), and an engine flag given
+here replaces that value.
 
   python3 tools/ppl_gate.py --model FILE.basalt --base base.kld --out DIR [--engine-bin BIN] [--chunks 20] [--t 3]
                             [--peer-slots 64 ...]
@@ -109,7 +110,10 @@ def run(a) -> int:
     first = n_ctx // 2
     args = ["--model", str(Path(a.model).resolve()), "--spec", "5",
             "--adapt-swaps", "0", "--peer-adapt-swaps", "0", "--max-context", "4096"]
-    if gpu_count() > 1:
+    if gpu_count() > 1 and not sys.platform.startswith("win"):
+        # A second visible GPU is a peer expert tier only where the platform gives a process peer access; the engine
+        # refuses --peer-device elsewhere, so adding it here would stop the run before it started. Pass it through
+        # --engine-args to ask for one explicitly.
         args += ["--peer-device", "1"]
     args = set_args(args, a.engine_args + ["--ppl-base", str(Path(a.base).resolve())])
     out = Path(a.out)
