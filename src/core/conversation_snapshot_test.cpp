@@ -318,7 +318,11 @@ int main() {
             check(a.bytes()==conversation_kv_bytes(f.state,f.g,upto,index),"size estimate equals snapshot payload");
             f.fill(177);
             check(conversation_kv_save(b,f.state,f.g,upto,index,err),"save B");
-            check(upto==0 || !equal(a,b),"fixture changes state");
+            // A draft image publishes whole pages of the cells its key names, so a short prefix publishes nothing and
+            // two saves at the same prefix are both empty; that is the rule, not a fixture that failed to change.
+            const int64_t published = index ? upto : draft_published_cells(upto, a.page_size ? a.page_size : 1);
+            if (published == 0) check(a.k.empty() && b.k.empty(), "a prefix with no whole page publishes no cells");
+            else check(!equal(a,b),"fixture changes state");
             check(conversation_kv_restore(a,f.state,f.g,upto,index,err),"restore A over B");
             cuda_check(cudaDeviceSynchronize());
             check(conversation_kv_save(restored,f.state,f.g,upto,index,err),"read back restored A");
@@ -332,17 +336,49 @@ int main() {
             }
             if (mode==2 && upto>0) {
                 const auto s=qsa_real_shapes();
-                const int64_t b1=(upto+s.page_size-1)/s.page_size,b0=std::max<int64_t>(0,b1-f.state.n_slots);
                 const size_t block=kv_block_bytes(s,fmt)/2;
                 // Codes and scales are separate in INT8; check code bytes here.
                 const size_t code_block=fmt==kKvInt8 ? s.page_size*s.n_head_kv*s.head_dim : block;
                 const void* slots=fmt==kKvQ4?(void*)f.state.k_q4:fmt==kKvInt8?(void*)f.state.k_q:(void*)f.state.k_pool;
                 std::vector<uint8_t> got(code_block);
-                for (int64_t page=b0;page<b1;++page) {
+                const int64_t published=a.cells/a.page_size;              // pages the image publishes
+                const int64_t token_pages=(upto+s.page_size-1)/s.page_size;   // pages the key names
+                // The ring's window is the TOKEN COUNT's, [token_pages - n_slots, token_pages): the restore refills the
+                // gap page too (zeroed), so it evicts the published page `published - n_slots`.  Every ring walker -
+                // this loop and conversation_kv_verify - starts at token_pages - n_slots, never at published - n_slots.
+                const int64_t ring0=std::max<int64_t>(0,token_pages-f.state.n_slots);
+                for (int64_t page=ring0;page<published;++page) {
                     cuda_check(cudaMemcpy(got.data(),(const uint8_t*)slots+(page%f.state.n_slots)*code_block,code_block,cudaMemcpyDeviceToHost));
                     std::vector<uint8_t> expected(code_block);
                     check(a.k.read(expected.data(), page*code_block, code_block),"read segmented expected draft page");
                     check(got == expected,"draft ring contains restored pages");
+                }
+                // The page the gap evicted is EXPECTED to be gone: its slot now holds the gap page, and asserting it is
+                // still there would encode the image's window rather than the ring's.
+                if (ring0 > std::max<int64_t>(0,published-f.state.n_slots)) {
+                    const int64_t evicted=published-f.state.n_slots;
+                    cuda_check(cudaMemcpy(got.data(),(const uint8_t*)slots+(evicted%f.state.n_slots)*code_block,code_block,cudaMemcpyDeviceToHost));
+                    std::vector<uint8_t> expected(code_block);
+                    check(a.k.read(expected.data(), evicted*code_block, code_block),"read the evicted page's image");
+                    check(got != expected,"the gap page evicts the oldest published page from the ring");
+                }
+                // The page holding the boundary cell is not published: a restore must leave it UNREADABLE, not merely
+                // out of the refill range.  It was zeroed in the host copy and refilled, so the ring holds zeros there
+                // and not the previous conversation's bytes.
+                if (token_pages>published) {
+                    std::vector<uint8_t> zero(code_block,0);
+                    for (int64_t page=published;page<token_pages;++page) {
+                        cuda_check(cudaMemcpy(got.data(),(const uint8_t*)slots+(page%f.state.n_slots)*code_block,code_block,cudaMemcpyDeviceToHost));
+                        check(got==zero,"the unpublished tail page is invalidated in the ring, not left stale");
+                        // The buffer pools() selects for this format - read through the exposed selector, not a second
+                        // copy of the branch: k_q for int8, k_q4 for q4, k_pool for fp16.
+                        const void* host_k = conversation_kv_pools(f.state, false)[0];
+                        std::vector<uint8_t> host_page(code_block);
+                        if (host_k != nullptr)
+                            std::memcpy(host_page.data(), (const uint8_t*) host_k + page * code_block, code_block);
+                        check(host_k != nullptr && host_page == zero,
+                              "the unpublished tail page is zeroed in the authoritative host copy");
+                    }
                 }
             }
             auto bad=a; bad.head_dim++;

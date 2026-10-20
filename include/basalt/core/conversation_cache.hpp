@@ -8,9 +8,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <new>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -85,6 +87,9 @@ struct ConversationCheckpoint {
     std::vector<ConversationImageKey> imgs;
     CheckpointBytes gdn, ple, tails, dead, block_pos;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
+    // A device slot mirroring `gdn` (GdnSlots): -1 when the pool had none free, and every reader falls back to the
+    // host bytes.  The slot holds a copy of the state, never the state itself.
+    int gdn_slot = -1;
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;
@@ -201,12 +206,66 @@ struct SavedConversation {
     }
 };
 
+/// Cells of the draft layer a token-prefix key of `tokens` tokens names.  The drafter's cell i pairs the main
+/// model's residual at position i with the token at i + 1, so its key is a bigram sequence: N tokens are N - 1
+/// bigrams, and a key of N tokens names cells [0, N - 1).  Cell N - 1 pairs with the token at N, which the key does
+/// not contain: it belongs to the next slice and shares this slice's boundary token.  Cached draft-path K/V is keyed
+/// by this count, never by the token count; what a key may publish is `draft_published_cells` below.
+inline int64_t draft_cells(int64_t tokens) { return tokens > 0 ? tokens - 1 : 0; }
+
+/// Cells of the draft layer a token-prefix key may PUBLISH: `draft_cells(tokens)` rounded down to whole pages.  The
+/// boundary cell sits inside the page that holds it, so a page-granular image cannot leave the cell out without
+/// leaving its page out; rounding down keeps that page outside the published range, and a restore invalidates the
+/// trailing pages it did not publish.  This is not floor(tokens/page)*page: the count derives from the cells the key
+/// names, so a page-aligned token count still publishes one page fewer.
+inline int64_t draft_published_cells(int64_t tokens, int64_t page) {
+    if (page <= 0) return draft_cells(tokens);
+    return draft_cells(tokens) / page * page;
+}
+
+/// Element-by-element token equality, any token width.  The reference the bulk compare has to agree with.
+template<class Token>
+bool conversation_ids_equal_linear(const int32_t* ids, size_t n, const Token* prompt) {
+    for (size_t i = 0; i < n; ++i)
+        if (!(ids[i] == prompt[i])) return false;
+    return true;
+}
+
+/// Length of the common prefix of two int32 token spans, bulk-compared: exponential doubling finds the first window
+/// that differs, then a bisection inside it, each probe one slice compare.  A long shared prefix - the agentic case -
+/// costs a handful of compares and scans every token once, instead of one compare per token.
+inline size_t conversation_common_prefix(const int32_t* a, const int32_t* b, size_t n) {
+    size_t done = 0, window = 1;   // [0, done) is equal
+    while (done < n) {
+        const size_t len = std::min(n - done, window);
+        if (std::memcmp(a + done, b + done, len * sizeof(int32_t)) != 0) {
+            size_t lo = done, hi = done + len;   // the first difference is in [lo, hi)
+            while (hi - lo > 1) {
+                const size_t mid = lo + (hi - lo) / 2;
+                if (std::memcmp(a + lo, b + lo, (mid - lo) * sizeof(int32_t)) == 0) lo = mid;
+                else hi = mid;
+            }
+            return lo;
+        }
+        done += len;
+        if (window < n) window = std::min(window * 2, n);
+    }
+    return n;
+}
+
+/// conversation_ids_equal_linear's answer, int32 tokens compared in bulk.
+template<class Token>
+bool conversation_ids_equal(const int32_t* ids, size_t n, const Token* prompt) {
+    if constexpr (std::is_same_v<Token, int32_t>) return conversation_common_prefix(ids, prompt, n) == n;
+    else return conversation_ids_equal_linear(ids, n, prompt);
+}
+
 template<class Token>
 int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
                             const std::vector<ConversationImageKey>& images) {
     const size_t n = c.ids.size();
     // The last prompt token always starts the next verify window.
-    if (n == 0 || n >= prompt.size() || !std::equal(c.ids.begin(), c.ids.end(), prompt.begin())) return 0;
+    if (n == 0 || n >= prompt.size() || !conversation_ids_equal(c.ids.data(), n, prompt.data())) return 0;
     size_t j = 0;
     for (const auto& image : images) {
         if (image.start >= (int64_t) n) continue;

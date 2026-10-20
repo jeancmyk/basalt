@@ -1,5 +1,7 @@
 #include "basalt/core/conversation_cache.hpp"
+#include "basalt/core/gdn_slots.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -333,6 +335,140 @@ int main() {
         check(b[0] == 9 && b[big - 1] == 4, "a reused buffer is not zeroed");
         CheckpointBytes small(100, 3), copy = small;
         check(copy.size() == 100 && copy[99] == 3, "small buffers still copy and fill");
+    }
+    {
+        // The bulk (galloping) key compare against the element-wise reference, at every divergence index, on a full
+        // match, and on the lengths around a page boundary.  A key is int32; a prompt may be either width, and the
+        // prefix must answer the same for both.
+        auto fill = [](size_t n, int32_t seed) {
+            std::vector<int32_t> v(n);
+            for (size_t i = 0; i < n; ++i) v[i] = (int32_t) ((i * 7 + (size_t) seed) % 97) - 3;
+            return v;
+        };
+        check(conversation_common_prefix(nullptr, nullptr, 0) == 0, "an empty slice has an empty common prefix");
+        for (size_t len : {size_t(0), size_t(1), size_t(2), size_t(3), size_t(7), size_t(127), size_t(128),
+                           size_t(129), size_t(1024), size_t(4097)}) {
+            const std::vector<int32_t> key = fill(len, 1);
+            for (size_t at = 0; at <= len; ++at) {          // `at == len`: the prompt starts with the whole key
+                std::vector<int32_t> prompt = fill(len + 3, 1);
+                if (at < len) prompt[at] = (int32_t) (prompt[at] + 1);   // differs exactly at `at`
+                const bool want = conversation_ids_equal_linear(key.data(), len, prompt.data());
+                check(conversation_ids_equal(key.data(), len, prompt.data()) == want,
+                      "bulk token equality matches the element-wise reference");
+                check(conversation_common_prefix(key.data(), prompt.data(), len) == (want ? len : at),
+                      "the common prefix ends at the first difference");
+                ConversationCheckpoint c;
+                c.ids = key;
+                const std::vector<int64_t> wide(prompt.begin(), prompt.end());
+                check(conversation_prefix(c, prompt, {}) == conversation_prefix(c, wide, {}),
+                      "an int32 prompt and an int64 one give the same prefix");
+            }
+            // the empty-slice boundary: no key, and a key as long as the prompt (the last token is never reused)
+            ConversationCheckpoint c;
+            c.ids = key;
+            check(conversation_prefix(c, std::vector<int32_t>{}, {}) == 0, "an empty prompt matches nothing");
+            std::vector<int32_t> exact = fill(len, 1);
+            check(conversation_prefix(c, exact, {}) == 0, "a prompt as long as the key cannot consume its last token");
+        }
+    }
+    {
+        // The draft layer's key is a bigram sequence: a prefix of N tokens names N - 1 cells, and a prefix too short
+        // to hold a pair names none.
+        check(draft_cells(0) == 0 && draft_cells(1) == 0, "a key shorter than two tokens names no draft cell");
+        for (int64_t n : {int64_t(2), int64_t(3), int64_t(128), int64_t(129), int64_t(100000)})
+            check(draft_cells(n) == n - 1, "a key of N tokens names N - 1 draft cells");
+        check(draft_cells(-1) == 0, "a negative token count names no draft cell");
+    }
+    {
+        // A/B for the bulk key compare: the linear scan against the galloping one on a long agentic prefix, CPU-only.
+        // Printed for the ledger, not a gate.
+        static volatile size_t sink = 0;   // keeps a timed compare from being optimized away
+        auto fill = [](size_t tokens, bool differ_last) {
+            std::vector<int32_t> v(tokens + 3);
+            for (size_t i = 0; i < v.size(); ++i) v[i] = (int32_t) ((i * 2654435761u) >> 11);
+            if (differ_last) v[tokens - 1] = (int32_t) (v[tokens - 1] + 1);
+            return v;
+        };
+        auto per_call_us = [](auto&& fn, size_t rounds) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (size_t r = 0; r < rounds; ++r) sink += fn();
+            const auto t1 = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::micro>(t1 - t0).count() / (double) rounds;
+        };
+        for (size_t tokens : {size_t(32768), size_t(131072)}) {
+            const std::vector<int32_t> key = fill(tokens, false);
+            const size_t rounds = tokens > 32768 ? 100 : 200;
+            for (bool late : {false, true}) {
+                const std::vector<int32_t> prompt = fill(tokens, late);
+                const double linear =
+                        per_call_us([&] { return conversation_ids_equal_linear(key.data(), tokens, prompt.data()); }, rounds);
+                const double gallop =
+                        per_call_us([&] { return conversation_ids_equal(key.data(), tokens, prompt.data()); }, rounds);
+                std::printf("cache prefix A/B: %zu tokens, %s: linear %.1f us, galloping %.1f us (%.2fx)\n", tokens,
+                            late ? "last token differs" : "full match", linear, gallop,
+                            gallop > 0.0 ? linear / gallop : 0.0);
+            }
+        }
+    }
+    {
+        // The GDN slot book: which slot holds which seqlen, and which are free.
+        GdnSlotBook b;
+        b.reset(2);
+        check(b.slots() == 2 && b.used() == 0, "two GDN slots, none holding a state");
+        const int x = b.take(40), y = b.take(41);
+        check(x >= 0 && y >= 0 && x != y && b.used() == 2, "two checkpoints take distinct slots");
+        check(b.seqlen(x) == 40 && b.seqlen(y) == 41, "each slot records the seqlen it holds");
+        check(b.take(42) == -1, "no slot while both are taken");
+        b.release(x);
+        check(b.used() == 1 && b.seqlen(x) == -1, "releasing a slot frees it");
+        check(b.take(42) == x, "the freed slot is handed out again");
+        b.release(y);
+        b.release(y);
+        check(b.used() == 1, "releasing twice frees once");
+        b.release(-1);
+        b.release(99);
+        check(b.used() == 1, "releasing an invalid slot is a no-op");
+        check(b.seqlen(-1) == -1 && b.seqlen(99) == -1, "an invalid slot holds nothing");
+        b.reset(0);
+        check(b.slots() == 0 && b.take(1) == -1, "no pool: no slot, and the caller keeps host bytes");
+        // A checkpoint copied out of the chain detaches: the slot goes back to the book and the checkpoint keeps its
+        // host bytes, so the image or the other chain never carries an index the pool may hand out again.
+        b.reset(1);
+        ConversationCheckpoint c;
+        c.gdn_slot = b.take(7);
+        c.gdn.assign(4, 9);
+        check(c.gdn_slot == 0 && b.seqlen(0) == 7, "a chain checkpoint holds a slot with its seqlen");
+        gdn_slot_detach(b, c);
+        check(c.gdn_slot == -1 && b.used() == 0 && b.seqlen(0) == -1 && c.gdn.size() == 4,
+              "detaching returns the slot and leaves the host bytes in place");
+        check(b.take(7) == 0, "the detached slot is handed out again");
+        b.release(0);
+        c.gdn_slot = b.take(8);
+        gdn_slot_detach(b, c);
+        gdn_slot_detach(b, c);
+        check(b.used() == 0, "detaching twice frees once");
+        ConversationCheckpoint none;   // never slotted: detaching is a no-op
+        gdn_slot_detach(b, none);
+        check(none.gdn_slot == -1 && b.used() == 0, "a checkpoint without a slot detaches to nothing");
+        // A chain dropped for a shorter resume must give its slots back: the pool holds two, so a leak on this path
+        // would leave every later checkpoint on host bytes for the rest of the process.  This is the serve loop's
+        // victim rule (ids longer than the resume point, or no longer a prefix of the prompt) applied to a chain.
+        GdnSlotBook pool;
+        pool.reset(2);
+        std::vector<ConversationCheckpoint> chain(4);
+        for (size_t i = 0; i < chain.size(); ++i) chain[i].ids.assign(i + 1, (int32_t) (i + 10));
+        chain[0].gdn_slot = pool.take((int64_t) chain[0].ids.size());
+        chain[1].gdn_slot = pool.take((int64_t) chain[1].ids.size());
+        check(pool.free() == 0 && pool.used() == 2, "two chain checkpoints hold both slots");
+        const int64_t resume = 0;   // the request resumes shorter than everything the chain holds
+        std::vector<size_t> victims;
+        for (size_t i = 0; i < chain.size(); ++i)
+            if ((int64_t) chain[i].ids.size() > resume) victims.push_back(i);
+        for (size_t i : victims) gdn_slot_detach(pool, chain[i]);
+        for (size_t n = victims.size(); n-- > 0;) chain.erase(chain.begin() + (std::ptrdiff_t) victims[n]);
+        check(chain.empty() && victims.size() == 4, "a shorter resume drops the whole chain");
+        check(pool.free() == 2 && pool.used() == 0, "dropping the chain returns every slot to the pool");
+        check(pool.take(9) >= 0, "a later checkpoint can still take a slot after the drop");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
