@@ -1,9 +1,9 @@
 // include/basalt/core/gdn_slots.hpp - device slots that hold a checkpoint's GDN recurrence.
 //
 // The recurrence cannot be recomputed from K/V, so a checkpoint without it is unusable, and it is the largest part of
-// one (~118 MB).  A slot keeps a checkpoint's state device-resident, so restoring it copies device to device instead
-// of over the host.  The session keeps its own buffer: the commit graph has the state's address baked in (verify.cpp,
-// capture_commit), so a slot is a mirror of that state, never a donation of it.
+// one.  A slot keeps a checkpoint's state device-resident, so restoring it copies device to device instead
+// of over the host.  The session keeps its own buffer: the captured commit graph binds that buffer's address,
+// so a slot is a mirror of the state, not a stand-in for it.
 #pragma once
 
 #include "basalt/core/conversation_cache.hpp"
