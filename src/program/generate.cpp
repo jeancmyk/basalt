@@ -916,9 +916,10 @@ bool checkpoint_save(ConvCheckpoint& c, const basalt::core::SessionState& ss, co
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
 bool checkpoint_restore(const ConvCheckpoint& c, basalt::core::SessionState& ss, const basalt::core::ModelGeometry& g) {
     std::string error;
-    const void* slot = c.gdn_slot >= 0 ? g_gdn_slots.ptr(c.gdn_slot) : nullptr;
+    const void* slot = g_gdn_slots.ptr(c.gdn_slot.index());
     if (basalt::core::diagnostics().profile) {   // which copy the state comes from: a slot is D2D, else host bytes
-        const std::string where = c.gdn_slot >= 0 ? "slot " + std::to_string(c.gdn_slot) + " (D2D)" : "host bytes";
+        const std::string where = c.gdn_slot.index() >= 0
+                                          ? "slot " + std::to_string(c.gdn_slot.index()) + " (D2D)" : "host bytes";
         std::fprintf(stderr, "basalt serve: checkpoint restore at %lld: %s\n", (long long) c.ids.size(), where.c_str());
     }
     if (basalt::core::conversation_checkpoint_restore(c, ss, g, error, slot)) {
@@ -929,13 +930,12 @@ bool checkpoint_restore(const ConvCheckpoint& c, basalt::core::SessionState& ss,
     return false;
 }
 
-/// Moves a checkpoint's recurrence out of its device slot into host bytes and frees the slot.  Anything that copies a
-/// checkpoint out of the session's chain calls this first: a slot index is valid only while that chain owns it.  A
-/// failure leaves the slot in place (the checkpoint stays restorable) and reports false, so the caller drops whatever
-/// it was about to publish.
+/// Reads a checkpoint's recurrence out of its device slot into host bytes and gives the slot back.  Only a chain
+/// member calls this: it is the owner, so releasing is its right.  A failure leaves the slot in place (the
+/// checkpoint stays restorable) and reports false, so the caller drops whatever it was about to publish.
 bool checkpoint_materialise(ConvCheckpoint& c, size_t gdn_bytes) {
-    if (c.gdn_slot < 0) return true;
-    const void* src = g_gdn_slots.ptr(c.gdn_slot);
+    if (c.gdn_slot.index() < 0) return true;
+    const void* src = g_gdn_slots.ptr(c.gdn_slot.index());
     if (src == nullptr || gdn_bytes == 0) return false;
     c.gdn.resize(gdn_bytes);
     const cudaError_t e = cudaMemcpy(c.gdn.data(), src, gdn_bytes, cudaMemcpyDeviceToHost);
@@ -944,7 +944,26 @@ bool checkpoint_materialise(ConvCheckpoint& c, size_t gdn_bytes) {
         c.gdn.clear();
         return false;
     }
-    basalt::core::gdn_slot_detach(g_gdn_slots.book(), c);
+    c.gdn_slot.release();
+    return true;
+}
+
+/// Fills a copy of a chain checkpoint - `dst`, already copied from `src` - with the recurrence the source's slot
+/// holds, and touches no ownership: the source keeps its slot and the copy never takes one.  A copy of an
+/// unslotted source already carries its host bytes, so there is nothing to read.  On failure the copy is left with
+/// no recurrence and reports false, so the caller drops it: a miss, never a state read through an index the source's
+/// chain still owns.
+bool checkpoint_clone(ConvCheckpoint& dst, const ConvCheckpoint& src, size_t gdn_bytes) {
+    if (src.gdn_slot.index() < 0) return true;
+    const void* slot = g_gdn_slots.ptr(src.gdn_slot.index());
+    if (slot == nullptr || gdn_bytes == 0) return false;
+    dst.gdn.resize(gdn_bytes);
+    const cudaError_t e = cudaMemcpy(dst.gdn.data(), slot, gdn_bytes, cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "basalt serve: checkpoint slot copy: %s\n", cudaGetErrorString(e));
+        dst.gdn.clear();
+        return false;
+    }
     return true;
 }
 
@@ -5765,11 +5784,10 @@ int main(int argc, char** argv) {
             (size_t) o.conversation_cache_slots);
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
-        // A chain that is dropped gives its slots back: a slot is owned by exactly one chain, and the pool never grows.
-        auto drop_chain = [&](std::vector<ConvCheckpoint>& chain) {
-            for (ConvCheckpoint& c : chain) basalt::core::gdn_slot_detach(g_gdn_slots.book(), c);
-            chain.clear();
-        };
+        // A chain that is dropped gives its slots back: a slot is owned by exactly one chain, and the pool never
+        // grows.  Clearing does it - a checkpoint returns the slot it holds when it is destroyed - and every other
+        // way a chain stops existing (an assignment, a slot handed back to the batch) gives them back the same way.
+        auto drop_chain = [&](std::vector<ConvCheckpoint>& chain) { chain.clear(); };
         auto park_current = [&](size_t held) -> bool {
             ckd_finish();
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
@@ -5949,23 +5967,24 @@ int main(int argc, char** argv) {
                 if (!gpu_sync_ok()) return false;
                 std::string ce;
                 // A free slot mirrors the recurrence device to device; without one the state goes to host bytes.
-                const int slot = gdn_state_bytes > 0 && stages.empty()
-                                         ? g_gdn_slots.book().take((int64_t) c.ids.size())
-                                         : -1;
-                if (slot >= 0) {
-                    if (!basalt::core::conversation_checkpoint_save(c, *rsp, g, ce, g_gdn_slots.ptr(slot))) {
-                        g_gdn_slots.book().release(slot);   // a failed mirror releases the slot
+                const bool slotted = gdn_state_bytes > 0 && stages.empty() &&
+                                     c.gdn_slot.acquire(g_gdn_slots.book(), (int64_t) c.ids.size());
+                if (slotted) {
+                    if (!basalt::core::conversation_checkpoint_save(c, *rsp, g, ce,
+                            g_gdn_slots.ptr(c.gdn_slot.index()))) {
+                        c.gdn_slot.release();   // a failed mirror gives the slot back
                         basalt::log::error("basalt serve", "checkpoint save: %s", ce.c_str());
                         return false;
                     }
-                    c.gdn_slot = slot;
-                    gdn_dump_pair("save", g_gdn_slots.ptr(slot), rsp->gdn_state, g_gdn_dump_bytes);   // right after
+                    gdn_dump_pair("save", g_gdn_slots.ptr(c.gdn_slot.index()), rsp->gdn_state,   // right after
+                                  g_gdn_dump_bytes);
                 } else if (defer && stages.empty()) {
                     if (!ckd.save(c, *rsp, g, ce)) { basalt::log::error("basalt serve", "checkpoint save: %s", ce.c_str()); return false; }
                 } else if (!checkpoint_save(c, *rsp, g)) return false;
                 if (basalt::core::diagnostics().profile) {   // which copy the state went to: a slot is D2D, else host bytes
-                    const std::string where =
-                            c.gdn_slot >= 0 ? "slot " + std::to_string(c.gdn_slot) + " (D2D)" : "host bytes";
+                    const std::string where = c.gdn_slot.index() >= 0
+                                                      ? "slot " + std::to_string(c.gdn_slot.index()) + " (D2D)"
+                                                      : "host bytes";
                     std::fprintf(stderr, "basalt serve: checkpoint save at %lld: %s\n", (long long) L, where.c_str());
                 }
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
@@ -5985,8 +6004,7 @@ int main(int argc, char** argv) {
                 const size_t victim = basalt::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
                                                                                    o.prompt_cache);
                 if (checks[victim].gdn.data() == ckd.pending()) ckd_finish();
-                basalt::core::gdn_slot_detach(g_gdn_slots.book(), checks[victim]);   // the victim's slot goes back
-                checks.erase(checks.begin() + (std::ptrdiff_t) victim);
+                checks.erase(checks.begin() + (std::ptrdiff_t) victim);   // the victim's slot goes back with it
             }
             return true;
         };
@@ -7675,7 +7693,14 @@ int main(int argc, char** argv) {
                 const basalt::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
                 if (at != nullptr) {
-                    if (!basalt::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
+                    // A chain parked in a slot may hold its recurrence in a pool slot; resolve it, so resuming from
+                    // that checkpoint is a device-to-device read and not a refusal.  The pool is only reserved where
+                    // there is no layer split, so the index names a buffer on the device this restore runs on, and a
+                    // stage part never holds one.  ptr() answers null for a checkpoint that holds no slot, and the
+                    // host bytes are used.
+                    const ConvCheckpoint& src = k == 0 ? *at : at->stage_parts[k - 1];
+                    if (!basalt::core::conversation_checkpoint_restore(
+                                src, to, g, e, g_gdn_slots.ptr(src.gdn_slot.index())))
                         return false;
                 } else if (held) {
                     if (!basalt::core::conversation_checkpoint_restore(slot_held.ck[k], to, g, e)) return false;
@@ -8691,9 +8716,7 @@ int main(int argc, char** argv) {
                 }
                 sb.cached = false;
                 sb.partial = false;
-                for (ConvCheckpoint& c : sb.checks)   // a discarded chain gives its slots back
-                    basalt::core::gdn_slot_detach(g_gdn_slots.book(), c);
-                sb.checks.clear();
+                drop_chain(sb.checks);   // a discarded chain gives its slots back
                 make_view(rview, slot_b);
                 rsp = &rview;
                 if (solo_req && !ver.bind_session(&rview, err)) {
@@ -8877,37 +8900,33 @@ int main(int argc, char** argv) {
                     slot_held = SlotHeld{};
                     live.clear();
                     live_imgs.clear();
-                    for (ConvCheckpoint& c : checks)   // a discarded chain gives its slots back
-                        basalt::core::gdn_slot_detach(g_gdn_slots.book(), c);
-                    checks.clear();
+                    drop_chain(checks);   // a discarded chain gives its slots back
                     resume = 0;
                     from_live = false;
                 } else {
-                    for (ConvCheckpoint& c : checks)   // a discarded chain gives its slots back
-                        basalt::core::gdn_slot_detach(g_gdn_slots.book(), c);
-                    checks.clear();   // the main session's checkpoints were of the conversation it held before
+                    drop_chain(checks);   // the main session's checkpoints were of the conversation it held before
                     conversations.limit_reuse(0);   // its cells now hold the slot's conversation, not the retained buffers'
                     // a read that gave way, the same request again (into its own slot): on with it - its segments and
                     // checkpoints as if it had not stopped
                     if (slot_ck == nullptr && bs[(size_t) slot_source].partial && admit_slot == slot_source) {
                         resumed_from0 = bs[(size_t) slot_source].partial_from0;
                         for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) {
-                            // a copy keeps host bytes only: the slot's chain still owns its own
+                            // a copy keeps host bytes only: the slot's chain still owns its slot
                             ConvCheckpoint copy = c;
-                            if (checkpoint_materialise(copy, gdn_state_bytes)) checks.push_back(std::move(copy));
+                            if (checkpoint_clone(copy, c, gdn_state_bytes)) checks.push_back(std::move(copy));
                         }
                         bs[(size_t) slot_source].partial = false;
                     }
                     if (slot_ck != nullptr) {
                         live = slot_ck->ids;
                         ConvCheckpoint copy = *slot_ck;   // the main session's chain has it now
-                        if (checkpoint_materialise(copy, gdn_state_bytes)) {
+                        if (checkpoint_clone(copy, *slot_ck, gdn_state_bytes)) {
                             checks.push_back(std::move(copy));
                             checks.back().used = ++check_clock;
                         } else {
-                            // the slot's state could not be materialised: the checkpoint is dropped, the read goes on
+                            // the slot's state could not be read out: the checkpoint is dropped, the read goes on
                             std::fprintf(stderr, "basalt serve: conversation cache: slot checkpoint dropped "
-                                                 "(materialise)\n");
+                                                 "(clone)\n");
                         }
                     } else {
                         live = bs[(size_t) slot_source].ids;
@@ -8985,15 +9004,14 @@ int main(int argc, char** argv) {
             }
             if (basalt::kernels::cvec().loaded()) basalt::kernels::cvec_set_enabled(want_cvec);
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
-            // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new.  The
-            // a dropped checkpoint must give its GDN slot back, and the pool holds two, so a leak would stop
-            // any later checkpoint from ever taking one.
+            // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new.  A
+            // dropped checkpoint gives its GDN slot back as it goes, and the pool holds two, so a leak here would
+            // stop any later checkpoint from ever taking one.
             {
                 std::vector<size_t> victims;
                 for (size_t i = 0; i < checks.size(); ++i)
                     if ((int64_t) checks[i].ids.size() > resume || !starts_with(checks[i].ids, checks[i].imgs))
                         victims.push_back(i);
-                for (size_t i : victims) basalt::core::gdn_slot_detach(g_gdn_slots.book(), checks[i]);
                 for (size_t n = victims.size(); n-- > 0;) checks.erase(checks.begin() + (std::ptrdiff_t) victims[n]);
             }
             live_ok = false;   // until this request has finished, the session is in between
@@ -9299,10 +9317,10 @@ int main(int argc, char** argv) {
                 for (const ConvCheckpoint& c : checks)   // the root / periodic checkpoints of this read
                     if ((int64_t) c.ids.size() <= q &&
                         basalt::core::conversation_ids_equal(c.ids.data(), c.ids.size(), ids32.data())) {
-                        // the slot's chain gets host bytes: a copy that kept the index would share one slot with the
-                        // session's chain.  Without one the entry is dropped - a miss, not an alias.
+                        // the slot's chain gets host bytes: a copy never holds the index the session's chain owns.
+                        // Without the bytes the entry is dropped - a miss, not an alias.
                         ConvCheckpoint copy = c;
-                        if (checkpoint_materialise(copy, gdn_state_bytes)) sl.checks.push_back(std::move(copy));
+                        if (checkpoint_clone(copy, c, gdn_state_bytes)) sl.checks.push_back(std::move(copy));
                     }
                 yielded_at = q;
                 yielded_slot = ys;
@@ -10859,8 +10877,8 @@ int main(int argc, char** argv) {
                     }
                     if (best != nullptr) {
                         ConvCheckpoint copy = *best;
-                        if (checkpoint_materialise(copy, gdn_state_bytes)) sl.checks.push_back(std::move(copy));
-                        else basalt::log::warn("basalt batch", "slot %d keeps no checkpoint (materialise)", admit_slot);
+                        if (checkpoint_clone(copy, *best, gdn_state_bytes)) sl.checks.push_back(std::move(copy));
+                        else basalt::log::warn("basalt batch", "slot %d keeps no checkpoint (clone)", admit_slot);
                     }
                     basalt::log::info("basalt batch", "slot %d takes %lld tokens (copied in %.1f ms)", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
