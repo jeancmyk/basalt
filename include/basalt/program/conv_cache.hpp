@@ -15,7 +15,7 @@
 // being first: after `prompt_cache` newer checkpoints it was gone, and the next chat read the whole
 // prefix again at prefill speed.  So:
 //
-//   * the root is PINNED: dropping it frees one slot's ~118 MB and costs every future conversation that
+//   * the root is PINNED: dropping it frees one whole slot and costs every future conversation that
 //     shares the prefix a full re-read of it;
 //   * every other slot rotates by least recent use.  A checkpoint's stamp advances when it is created,
 //     when a new checkpoint lands on its length, and when a request mounts through it.

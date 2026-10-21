@@ -513,7 +513,7 @@ int spill_cases() {
         {"free fell by more than the allocation", 100.0, 60.0, 30.0, 0.0},
         {"free unchanged: nothing to judge", 100.0, 100.0, 30.0, 0.0},
         {"free rose: something else was freed", 100.0, 110.0, 30.0, 0.0},
-        // the fall is 0.001 GiB (about 1 MiB) short of the allocation, so the shortfall is inside the 32 MiB tolerance
+        // a fall just short of the allocation: the shortfall is inside the tolerance the check allows
         {"shortfall inside the tolerance", 100.0, 70.001, 30.0, 0.0},
         {"half of it placed in system memory", 200.0, 150.0, 100.0, 50.0},
         {"a zero-byte allocation", 100.0, 90.0, 0.0, 0.0},

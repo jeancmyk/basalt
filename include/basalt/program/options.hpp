@@ -215,8 +215,8 @@ struct Options {
     /// swap `kSatBoost` times as many.
     int adapt_swaps = 96;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole prompt
-    /// again).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and the PLE history (~118 MB of host
-    /// RAM); the KV cache itself is positional and stays where it is.
+    /// again).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and the PLE history; the KV
+    /// cache itself is positional and stays where it is.
     int prompt_cache = 6;
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;

@@ -828,7 +828,7 @@ int argmax(const std::vector<float>& v) {
 //     block being filled, never its pooled row), so rewinding to a position just means writing from there again.
 //   * RUNNING state - the 36 GDN recurrences and conv histories, each QSA layer's indexer tail (the unfinished
 //     block's raw keys) and the PLE's normalized history.  Each describes "everything so far" and cannot be
-//     rewound, so a checkpoint is a copy of exactly these: ~118 MB, the same set the verifier snapshots to roll
+//     rewound, so a checkpoint is a copy of exactly these: the same set the verifier snapshots to roll
 //     back rejected drafts.
 // A checkpoint is only valid while the positional cells below it still hold ITS tokens, so the serve loop keeps
 // just the checkpoints that are prefixes of the tokens the session holds now.
