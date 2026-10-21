@@ -179,7 +179,10 @@ class ProcessEngine:
             loading.set()                               # the narrator stops and the log handle goes back
             if log:
                 self.log.close()
-            raise EngineStartError(f"the engine could not be started: {e}", log) from e
+            # The binary is named here rather than taken from the exception: Windows reports a failed spawn without
+            # setting OSError.filename, and the caller needs to know which engine path was tried.
+            tried = engine_bin if e.filename is None else str(e.filename)
+            raise EngineStartError(f"the engine could not be started: {e} ({tried})", log) from e
         frame_pipes(self.proc, sink is not None)
         if sink:
             threading.Thread(target=pump_lines, args=(self.proc.stderr, sink), daemon=True).start()
