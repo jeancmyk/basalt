@@ -152,7 +152,7 @@ int main() {
                     long_trace[0].k, name((Source) short_trace[0].source), short_trace[0].k);
     }
     // REMOVED, and it was a finding rather than a missing test: under a FIXED accepted count the controller's choice
-    // never settles (measured: k changed on ~80% of windows forever, around k = level + 1).  The cause is in the
+    // never settles: k keeps changing forever around k = level + 1.  The cause is in the
     // controller, not in the model: choose() is a pure argmax over widths whose min_gain margin applies only against
     // k = 0 (controller.cpp:36-53), while observe() pulls positions k..K_MAX-1 UP toward p[k-1] whenever the window was
     // fully accepted (:66-70).  A narrow window therefore re-raises exactly the position the next wider window rejects,
