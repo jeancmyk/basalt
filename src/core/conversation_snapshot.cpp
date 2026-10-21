@@ -4,9 +4,11 @@
 #include "conversation_checked.hpp"
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 namespace basalt::core {
 namespace {
@@ -271,16 +273,21 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
                                       ? (size_t) basalt::kernels::kv_q4_bytes_per_head((int) g.head_dim) : cell;
         const size_t scale_cell = (size_t) g.n_head_kv *
                 (int8_keys && !st.kv_q4 ? (size_t) (g.head_dim / 64) * 2 : 0);
-        const size_t gap_cells = (size_t) (pages - end) * (size_t) l.page_size;
         const std::array<size_t,5> per = {(size_t) g.n_head_kv * cell, (size_t) g.n_head_kv * v_cell,
                                           scale_cell, st.kv_hybrid ? 0 : scale_cell, 0};
+        const size_t gap_pages = (size_t) (pages - end);
         for (size_t i = 0; i < per.size(); ++i) {
             if (per[i] == 0 || dst[i] == nullptr) continue;
-            const size_t from = (size_t) end * (size_t) l.page_size * per[i];
-            const cudaError_t z = cudaMemset(static_cast<uint8_t*>(dst[i]) + from, 0, gap_cells * per[i]);
-            if (z != cudaSuccess) {
-                error = std::string("conversation snapshot unpublished page: ") + cudaGetErrorString(z);
-                return false;
+            // One page at a time through the same transfer the restore uses: the authoritative side is a device pool
+            // in mode 0 and a host array in the streaming modes, and a device memset has nothing to address in the
+            // second case.  Pages are grouped so a long gap does not become many small calls or a large allocation.
+            const size_t row = (size_t) l.page_size * per[i];
+            const size_t chunk = std::max<size_t>(1, std::min(gap_pages, (size_t) 1 << 20) / std::max(row, (size_t) 1));
+            const std::vector<uint8_t> zeros(chunk * row, 0);
+            uint8_t* at = static_cast<uint8_t*>(dst[i]) + (size_t) end * row;
+            for (size_t done = 0; done < gap_pages; done += chunk) {
+                const size_t n = std::min(chunk, gap_pages - done);
+                if (!transfer(at + done * row, zeros.data(), n * row, error)) return false;
             }
         }
     }
