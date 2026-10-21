@@ -2156,20 +2156,10 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
               (why.empty() ? std::string{} : ": " + why);
         return false;
     }
-    // unbuffered when the drive is read anyway and the file cache could not keep the experts for the next start
-    // either; otherwise the buffered readers, which a warm restart serves from the cache
-    std::vector<std::string> files{path};
-    std::string why;
-    const bool unbuffered = experts_unbuffered(files, want + (uint64_t) blob, why);
-    const int readers = unbuffered ? std::max(threads, 16) : threads;   // 16 keep a PCIe 5 drive's queue full
-    LoadStats st;
-    if (unbuffered) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20,
-                                             files_in.experts.offset);
-    if (!unbuffered || (!st.ok && st.error.empty()))   // unaligned ranges: the buffered reader
-        st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20,
-                                 files_in.experts.offset);
-    std::fprintf(stderr, "basalt generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
-                 why.c_str());
+    // Buffered reads through the file cache; a warm restart serves from the cache.
+    LoadStats st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20,
+                                       files_in.experts.offset);
+    std::fprintf(stderr, "basalt generate: expert arena read through the file cache\n");
     if (!st.ok) {
         delete a;
         err = "ArenaExpertSource: the expert load was refused: " + (st.error.empty() ? std::string("unknown") : st.error);
@@ -2181,6 +2171,7 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
         return false;
     }
     arena_ = a;
+    basalt::core::set_report_arena(a);
     base_ = a->data();
     pinned_bytes_ = a->registered_bytes;
     // device aliases of the mapped registration, for the PCIe share of the misses

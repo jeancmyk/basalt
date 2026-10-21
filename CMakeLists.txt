@@ -168,6 +168,9 @@ add_library(platform STATIC src/platform/file.cpp src/platform/memory.cpp src/pl
 target_include_directories(platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # dlopen (DynLib) lives in libdl before glibc 2.34
 target_link_libraries(platform PUBLIC warnings ${CMAKE_DL_LIBS})
+if(WIN32)
+    target_link_libraries(platform PUBLIC dxgi psapi)
+endif()
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
