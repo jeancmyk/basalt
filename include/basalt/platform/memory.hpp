@@ -58,8 +58,9 @@ void free_region(void* mapping_base, uint64_t mapping_bytes);
 
 /// The most host memory the GPU may map page-locked before its shared-memory segment is full, when the OS limits it
 /// beneath the driver's own refusal (`why` names where the figure comes from); false when it does not, and the driver's
-/// refusal is the limit.
-bool pin_budget(uint64_t& limit, std::string& why);
+/// refusal is the limit.  `luid` is the 8 bytes of the device's LUID when the caller has one, which picks the adapter
+/// whose budget applies; without it the first adapter is asked.
+bool pin_budget(uint64_t& limit, std::string& why, const void* luid = nullptr);
 
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
@@ -71,6 +72,15 @@ uint64_t available_memory();
 /// page file together, so on Windows this is the free part of that pair - the reading a refused allocation names.
 /// Linux keeps no separate charge, so there it is the available-RAM reading (0 when unknown).
 uint64_t commit_headroom();
+
+/// The whole of what the OS may commit, in bytes: RAM plus the page file on Windows, which is the ceiling a
+/// page-locked arena has to fit under; the physical RAM on Linux, which keeps no separate charge (0 when unknown).
+uint64_t commit_limit();
+
+/// The working-set quota this process is held to, in bytes: the minimum the OS keeps resident and the maximum it may
+/// take. Pages locked with `lock_resident` are charged against the minimum, so a refused lock is read against this.
+/// False where the OS has no such quota.
+bool working_set_quota(uint64_t& min_bytes, uint64_t& max_bytes);
 
 /// The RAM left alone by anything that locks or fills memory: the larger of 2 GiB and 5% of the machine's RAM.
 uint64_t ram_margin();
@@ -173,6 +183,12 @@ inline bool file_cache_keeps(uint64_t avail, uint64_t arena_bytes, uint64_t read
 
 /// Whether `advise_willneed` asks the OS for anything: it does on both platforms.
 bool read_ahead_enabled();
+/// Print DXGI video-memory budget/usage for the default adapter (Windows; no-op elsewhere).
+void print_dxgi_memory_report();
+/// DXGI shared (non-local) memory budget in bytes for the adapter whose LUID matches `luid` (8 bytes),
+/// or 0 when unknown/unavailable. NULL `luid` queries the first adapter.
+uint64_t dxgi_non_local_budget(const void* luid);
+
 /// Asks the OS to start bringing [p, p + bytes) of a mapped file view into memory, without waiting for the access.
 /// A hint, never an error: the system skips what it will not prefetch and says nothing about it, and without the
 /// hint the pages still arrive - one fault at a time, where they are touched.  The range is asked for in 128 KiB

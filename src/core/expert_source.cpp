@@ -2381,6 +2381,7 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
                                  files_in.experts.offset);
     basalt::log::info("basalt generate", "expert arena read %s (%s)", unbuffered ? "unbuffered" : "through the file cache",
                  why.c_str());
+    basalt::core::set_report_arena(a);
     if (!st.ok) {
         delete a;
         err = "ArenaExpertSource: the expert load was refused: " + (st.error.empty() ? std::string("unknown") : st.error);
@@ -2392,6 +2393,7 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
         return false;
     }
     arena_ = a;
+    basalt::core::set_report_arena(a);
     base_ = a->data();
     pinned_bytes_ = a->registered_bytes;
     // device aliases of the mapped registration, for the PCIe share of the misses

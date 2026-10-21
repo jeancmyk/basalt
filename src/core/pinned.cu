@@ -3,6 +3,7 @@
 #include "basalt/core/pinned.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
+#include "basalt/platform/system.hpp"
 
 #include <cuda_runtime.h>
 
@@ -30,7 +31,6 @@ uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed) {
 namespace {
 bool clear_error() { (void) cudaGetLastError(); return true; }
 }  // namespace
-
 
 
 namespace {
@@ -78,9 +78,12 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             // Stop below the shared-memory budget rather than at the driver's refusal, and only when the budget is
             // actually smaller than the arena: an arena the segment can hold is pinned whole, as before.
             if (!capped) {
+                // The budget belongs to the adapter this arena is pinned for, so name that adapter by LUID.
+                cudaDeviceProp prop{};
+                const bool have_prop = cudaGetDeviceProperties(&prop, 0) == cudaSuccess;
                 uint64_t seg = 0;
                 std::string seg_why;
-                if (basalt::platform::pin_budget(seg, seg_why) && seg < bytes) {
+                if (basalt::platform::pin_budget(seg, seg_why, have_prop ? &prop.luid : nullptr) && seg < bytes) {
                     limited = true;
                     limit = seg;
                     limit_why = std::move(seg_why);
@@ -154,21 +157,6 @@ LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_byte
     std::vector<uint64_t> off((size_t) layers), n((size_t) layers, blobs_per_layer * blob_bytes);
     for (uint64_t L = 0; L < layers; ++L) off[(size_t) L] = L * blobs_per_layer * blob_bytes;
     return load_experts_ranges(path, dst, off, n, threads, chunk);
-}
-
-LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
-                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk, uint64_t base) {
-    LoadStats st;
-    st.ok = false;
-    (void) path; (void) dst; (void) layer_off; (void) layer_bytes; (void) threads; (void) chunk; (void) base;
-    return st;
-}
-
-bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_bytes, std::string& why,
-                        bool cache_counts, uint64_t read_bytes) {
-    (void) files; (void) arena_bytes; (void) cache_counts; (void) read_bytes;
-    why = "buffered";
-    return false;
 }
 
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
@@ -302,6 +290,61 @@ StreamStats stream_bandwidth(const uint8_t* src, uint64_t bytes, uint64_t chunk,
     cudaStreamDestroy(s);
     cudaFree(dst);
     return st;
+}
+
+namespace {
+PinnedArena* g_report_arena = nullptr;
+}  // namespace
+
+void set_report_arena(PinnedArena* arena) { g_report_arena = arena; }
+
+void print_memory_report() {
+    static bool printed = false;
+    if (printed) return;
+    printed = true;
+    std::fprintf(stderr, "basalt memory-report:\n");
+    // Every figure comes from the platform probe, so one line reads out the same way on both platforms: what the OS
+    // has, what it can still hand out, and what it can still commit - the pair a page-locked arena must fit inside.
+    std::fprintf(stderr, "  host: total phys %llu MiB, avail phys %llu MiB, commit limit %llu MiB, commit headroom %llu MiB\n",
+                 (unsigned long long) (basalt::platform::total_physical_memory() >> 20),
+                 (unsigned long long) (basalt::platform::available_memory() >> 20),
+                 (unsigned long long) (basalt::platform::commit_limit() >> 20),
+                 (unsigned long long) (basalt::platform::commit_headroom() >> 20));
+    const basalt::platform::ProcessMemory pmem = basalt::platform::process_memory();
+    std::fprintf(stderr, "  process: resident %llu MiB, peak resident %llu MiB, private %llu MiB\n",
+                 pmem.rss_mib, pmem.peak_rss_mib, pmem.private_mib);
+    uint64_t ws_min = 0, ws_max = 0;
+    if (basalt::platform::working_set_quota(ws_min, ws_max))
+        std::fprintf(stderr, "  working set quota: min %llu MiB, max %llu MiB\n",
+                     (unsigned long long) (ws_min >> 20), (unsigned long long) (ws_max >> 20));
+    if (g_report_arena) {
+        const char* backing = "unknown";
+        switch (g_report_arena->backing) {
+            case PageBacking::LargePages: backing = "large pages"; break;
+            case PageBacking::NormalPages: backing = "normal pages"; break;
+            case PageBacking::PinnedByCuda: backing = "pinned by cuda"; break;
+        }
+        if (g_report_arena->slice_bytes == 0) {
+            std::fprintf(stderr, "  arena: capacity %llu MiB, backing %s, registered %llu MiB (whole), locked %llu MiB\n",
+                         (unsigned long long) (g_report_arena->capacity >> 20), backing,
+                         (unsigned long long) (g_report_arena->registered_bytes >> 20),
+                         (unsigned long long) (g_report_arena->locked_bytes >> 20));
+        } else {
+            std::fprintf(stderr, "  arena: capacity %llu MiB, backing %s, registered %llu MiB (%d slices of %llu MiB), locked %llu MiB\n",
+                         (unsigned long long) (g_report_arena->capacity >> 20), backing,
+                         (unsigned long long) (g_report_arena->registered_bytes >> 20), g_report_arena->registered_slices,
+                         (unsigned long long) (g_report_arena->slice_bytes >> 20),
+                         (unsigned long long) (g_report_arena->locked_bytes >> 20));
+        }
+        std::fprintf(stderr, "  arena note: %s\n", g_report_arena->note.empty() ? "(none)" : g_report_arena->note.c_str());
+    } else {
+        std::fprintf(stderr, "  arena: none recorded\n");
+    }
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
+        std::fprintf(stderr, "  vram: free %llu MiB / total %llu MiB\n",
+                     (unsigned long long) (free_b >> 20), (unsigned long long) (total_b >> 20));
+    basalt::platform::print_dxgi_memory_report();   // reports nothing where the display driver does not budget VRAM
 }
 
 }  // namespace basalt::core

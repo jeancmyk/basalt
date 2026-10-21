@@ -49,10 +49,12 @@ std::string cgroup_root();
 
 /// This process's own memory use, for the stall report. Every field is 0 where the OS gives no reading.
 struct ProcessMemory {
-    unsigned long long faults = 0;       ///< hard page faults
+    unsigned long long faults = 0;       ///< page faults (hard faults on Linux, every fault on Windows)
     unsigned long long rss_mib = 0;      ///< resident set
     unsigned long long avail_mib = 0;    ///< RAM the system can hand out
     unsigned long long commit_mib = 0;   ///< what is swapped out
+    unsigned long long peak_rss_mib = 0; ///< the highest the resident set has been
+    unsigned long long private_mib = 0;  ///< on the process's own account: PrivateUsage, or the address space
 };
 ProcessMemory process_memory();
 

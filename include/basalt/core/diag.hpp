@@ -10,6 +10,7 @@ struct Diag {
     bool profile = false;      ///< --profile: per-stage GPU stamps of the verify window (turns PDL off; not for A/B)
     bool wait_stats = false;   ///< --wait-stats: the MoE tail's wait counters, one report per 200 windows
     bool decode_timing = false;   ///< --decode-timing: the per-request decode timing line
+    bool memory_report = false;   ///< --memory-report: print the consolidated memory report at startup
     std::string draft_log;     ///< --draft-log FILE: one line per verify window (width, accepted, ms)
     std::map<std::string, double> exp;   ///< --exp NAME=V: short-lived experiment gates, removed when they resolve
 };

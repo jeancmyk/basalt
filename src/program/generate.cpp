@@ -514,6 +514,7 @@ void usage() {
                  "  --profile            GPU stage times of the decode windows (serve path)\n"
                  "  --wait-stats         the host's wait times in the decode loop (serve path)\n"
                  "  --decode-timing      one line per request: where its decode time went (serve path)\n"
+                 "  --memory-report      print the consolidated memory/VRAM/IO report at startup (diagnostic)\n"
                  "  --draft-log FILE     one line per decode window for draft-policy study\n"
                  "  --ppl-base FILE      llama.cpp KL-divergence base for ppl= requests\n"
                  "  --ppl-out FILE       where ppl= requests write their per-row lines\n"
@@ -1312,6 +1313,7 @@ int main(int argc, char** argv) {
         else if (a == "--profile") basalt::core::diagnostics().profile = true;
         else if (a == "--wait-stats") basalt::core::diagnostics().wait_stats = true;
         else if (a == "--decode-timing") basalt::core::diagnostics().decode_timing = true;
+        else if (a == "--memory-report") basalt::core::diagnostics().memory_report = true;
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = next("--draft-log");
         else if (a == "--exp") {
             const std::string list = next("--exp");   // NAME=VALUE[,NAME=VALUE...]
@@ -3054,6 +3056,7 @@ int main(int argc, char** argv) {
                      arena_src.load_gib_per_second());
         srcp = &arena_src;
     }
+    if (basalt::core::diagnostics().memory_report) basalt::core::print_memory_report();
     // the pool is built once the start-up picks are known (below, with the resident RAM plan)
     std::optional<basalt::kernels::cpu::ExpertPool> pool_store;
     uint64_t ram_available_at_plan = 0;   // the available RAM the start-up plan was sized from

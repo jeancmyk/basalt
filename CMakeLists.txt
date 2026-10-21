@@ -181,6 +181,7 @@ target_include_directories(platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(platform PUBLIC warnings ${CMAKE_DL_LIBS})
 if(WIN32)
   target_link_libraries(platform PUBLIC advapi32)   # the processor name in the registry
+  target_link_libraries(platform PUBLIC dxgi psapi)
 endif()
 
 # ---- core (GPU runtime) ---------------------------------------------
