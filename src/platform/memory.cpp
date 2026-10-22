@@ -104,8 +104,12 @@ LockResult lock_resident(void* p, uint64_t bytes) {
         const SIZE_T margin = (SIZE_T) 512 << 20;
         const SIZE_T new_min = min_ws + (SIZE_T) bytes + margin;
         const SIZE_T new_max = max_ws > new_min + margin ? max_ws : new_min + margin;
+        // The minimum is the hard limit and the maximum stays soft, so the process may still grow past it.
+        // MIN_DISABLE (which this call used to pass) fails the whole call with ERROR_INVALID_PARAMETER (87) at every
+        // size: the minimum is then never raised, the VirtualLock below fails with ERROR_WORKING_SET_QUOTA (1453)
+        // however much RAM is free, and the region's pages are trimmed straight back out.
         if (!SetProcessWorkingSetSizeEx(self, new_min, new_max,
-                                        QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE))
+                                        QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE))
             quota_note = "SetProcessWorkingSetSizeEx(" + std::to_string((unsigned long long) (new_min >> 20)) +
                          " MiB) failed (error " + std::to_string(GetLastError()) + ")";
     }
