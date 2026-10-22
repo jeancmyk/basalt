@@ -149,6 +149,16 @@ public:
         repark = ms_repark_;
     }
 
+    /// **`run_phase`'s FOUR barriers, accumulated ms, and how many phases ran.**  Each multi-token phase waits for the
+    /// workers to park, publishes, drains on the host, waits for the batch to finish, then waits for the workers to
+    /// re-park.  `phase_ms` folds all of that into one number per phase, which cannot say whether the time is the
+    /// work or the hand-offs, so this splits it.
+    struct PhaseBreak {
+        double pre_park = 0, drain = 0, wait_done = 0, repark = 0;
+        long long phases = 0;
+    };
+    const PhaseBreak& phase_break() const { return break_; }
+
     /// **A PARKED WORKER SPINS FOR THIS LONG, THEN SLEEPS.**  The park is a `_mm_pause` spin because a layer's batches
     /// are microseconds apart and a wake-up from the OS costs more than that.  But a spin that never ends keeps every
     /// worker's core at 100% while the engine waits for a request.  Between requests the workers block on `sleep_cv_`.
@@ -186,6 +196,7 @@ private:
     double ms_wait_park_ = 0.0;
     double ms_drain_ = 0.0;
     double ms_repark_ = 0.0;
+    PhaseBreak break_;
     // ---- EACH ATOMIC GETS ITS OWN CACHE LINE.
     //
     // `head_`, `done_`, `parked_` and `epoch_` are the four that workers and the host actually contend on; sharing a

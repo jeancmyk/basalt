@@ -706,6 +706,10 @@ void usage() {
                  "  --profile            GPU stage times of the decode windows (serve path)\n"
                  "  --wait-stats         the host's wait times in the decode loop (serve path)\n"
                  "  --decode-timing      one line per request: where its decode time went (serve path)\n"
+                 "  --pool-timing        one line per request: the expert pool's four hand-offs per phase - the\n"
+                 "                       waits around the work, not the work (serve path, diagnostic)\n"
+                 "  --memory-report      print the consolidated memory/VRAM/IO report at startup, and again on the\n"
+                 "                       MEMREPORT command (diagnostic)\n"
                  "  --draft-log FILE     one line per decode window for draft-policy study\n"
                  "  --ppl-base FILE      llama.cpp KL-divergence base for ppl= requests\n"
                  "  --ppl-out FILE       where ppl= requests write their per-row lines\n"
@@ -1514,6 +1518,8 @@ int main(int argc, char** argv) {
         else if (a == "--profile") basalt::core::diagnostics().profile = true;
         else if (a == "--wait-stats") basalt::core::diagnostics().wait_stats = true;
         else if (a == "--decode-timing") basalt::core::diagnostics().decode_timing = true;
+        else if (a == "--pool-timing") basalt::core::diagnostics().pool_timing = true;
+        else if (a == "--memory-report") basalt::core::diagnostics().memory_report = true;
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = next("--draft-log");
         else if (a == "--exp") {
             const std::string list = next("--exp");   // NAME=VALUE[,NAME=VALUE...]
@@ -8405,12 +8411,17 @@ int main(int argc, char** argv) {
             struct DecSnap {
                 double wait, pool, host, plan, actq, jobs, run, peer_wait;
                 int64_t misses, entries, hits, pcie, peer;
+                // the pool's own hand-offs inside each multi-token phase, so the CPU time can be split into work
+                // versus barrier instead of being one number
+                double pre_park, phase_drain, wait_done, repark;
+                long long phases;
             };
             auto dec_snap = [&]() {
+                const auto& br = pool.phase_break();
                 return DecSnap{ver.ms_wait, ver.ms_pool, ver.ms_host, drive.d.ms_plan, drive.d.ms_actq, drive.d.ms_jobs,
                                drive.d.ms_run, drive.d.peer != nullptr ? drive.d.peer->ms_wait : 0.0,
                                drive.d.multi_misses, drive.d.multi_entries, drive.d.cache_hits, drive.d.pcie_experts,
-                               drive.d.peer_entries};
+                               drive.d.peer_entries, br.pre_park, br.drain, br.wait_done, br.repark, br.phases};
             };
             const DecSnap ds0 = dec_snap();
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
@@ -8849,6 +8860,18 @@ int main(int argc, char** argv) {
                              drive.d.peer == nullptr ? "" : (", peer GPU " + fmt2((d1.peer - ds0.peer) / (w * L)) +
                                                              " (the pool waits " + fmt2((d1.peer_wait - ds0.peer_wait) / w) +
                                                              " ms/window for it)").c_str());
+                // Where the per-layer host CPU time actually goes: the pool's four hand-offs per multi-token phase.
+                // `CPU experts` above is the work; these are the barriers around it. Only under --pool-timing, since
+                // without it run_phase does not time the hand-offs and every counter below is zero.
+                if (basalt::core::diagnostics().pool_timing && d1.phases > ds0.phases) {
+                    const double ph = (double) (d1.phases - ds0.phases);
+                    const double b_pre = d1.pre_park - ds0.pre_park, b_dr = d1.phase_drain - ds0.phase_drain;
+                    const double b_wd = d1.wait_done - ds0.wait_done, b_rp = d1.repark - ds0.repark;
+                    std::fprintf(stderr, "basalt decode pool: %.0f phases/req, per phase: pre-park %.3f + drain %.3f "
+                                         "+ wait-done %.3f + re-park %.3f = %.3f ms; per request %.2f ms of hand-offs\n",
+                                 ph, b_pre / ph, b_dr / ph, b_wd / ph, b_rp / ph,
+                                 (b_pre + b_dr + b_wd + b_rp) / ph, b_pre + b_dr + b_wd + b_rp);
+                }
                 const std::string evr = basalt::core::decode_events().report();
                 if (!evr.empty()) std::fprintf(stderr, "%s\n", evr.c_str());
                 const std::string pr = ver.profile_report();

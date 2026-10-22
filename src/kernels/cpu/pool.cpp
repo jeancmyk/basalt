@@ -1,5 +1,6 @@
 // src/kernels/cpu/pool.cpp - the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/core/diag.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -360,16 +361,37 @@ void ExpertPool::idle_stop() {
 }
 
 void ExpertPool::run_phase(int mode, int n_tasks) {
+    // The four hand-offs are timed apart only under --pool-timing.  Five clock reads land inside a phase that
+    // itself runs in microseconds, so timing them unconditionally would perturb the very thing being measured.
+    const bool timed = basalt::core::diagnostics().pool_timing;
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point t1, t2, t3, t4, t5;
+    const auto stamp = [&](Clock::time_point& t) { if (timed) t = Clock::now(); };
     idle_stop();
+    stamp(t1);
     wait_parked("before a phase");
+    stamp(t2);
     mode_ = mode;
     njobs_ = n_tasks;
     const uint32_t e = begin_batch(n_tasks);
     drain(-1, host_scratch_, e);
+    stamp(t3);
     wait_done(n_tasks);
+    stamp(t4);
     wait_parked("after a phase");
+    stamp(t5);
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    if (timed) {
+        auto ms = [](Clock::time_point a, Clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        break_.pre_park += ms(t1, t2);
+        break_.drain += ms(t2, t3);
+        break_.wait_done += ms(t3, t4);
+        break_.repark += ms(t4, t5);
+        ++break_.phases;
+    }
 }
 
 void ExpertPool::run_split(ExpertJob* jobs, int n) {

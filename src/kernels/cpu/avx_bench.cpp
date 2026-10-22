@@ -7,6 +7,7 @@
 // thread on one cache-resident expert (compute ceiling).  The last line is one NVFP4 expert through the expert pool
 // (the decode CPU tier's path): cold, the pool's idle read of it, and the expert computed after that read.  Calls go straight to each set's kernels, so the CPU can
 // time the set it does not dispatch to.  Weights are random bytes with a valid scale field.
+#include "basalt/core/diag.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -97,6 +98,9 @@ double run_1t(const Op& op, uint8_t* blob, int reps) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    // This program measures the pool's phases, so it asks for the hand-off timers the engine keeps behind
+    // --pool-timing; the engine's default is off.
+    basalt::core::diagnostics().pool_timing = true;
     if (argc > 1) NT = std::atoi(argv[1]);
     const int threads = argc > 2 ? std::atoi(argv[2]) : 14;
     const int E = argc > 3 ? std::atoi(argv[3]) : 96;
@@ -292,6 +296,38 @@ int main(int argc, char** argv) {
         std::printf("NVFP4 expert via the pool (%d workers + host, %.2f MB): cold %.1f us (%.1f GB/s)   idle read %.1f us   "
                     "after the read %.1f us\n", pool.workers(), f.bytes / 1e6, med(cold), f.bytes / (med(cold) * 1e3),
                     med(readus), med(warm));
+        // Per-batch cost at several batch sizes, and how each batch splits into the phase's four hand-offs and its
+        // work. A batch of 1 and a batch of K differ only in the work, so the gap between them prices the barrier.
+        for (int nb_experts : {1, 2, 4, 8, 16}) {
+            std::vector<std::vector<uint8_t>> eact((size_t) nb_experts * NT);   // one activation buffer per expert-token
+            std::vector<std::vector<float>> eout((size_t) nb_experts * NT, std::vector<float>(NH));
+            std::vector<cpu::ExpertJobMulti> jobs((size_t) nb_experts);
+            for (int e = 0; e < nb_experts; ++e) {
+                jobs[(size_t) e].blob = base + stride * (size_t) (pick++ % NB);
+                jobs[(size_t) e].nt = NT;
+                for (int t = 0; t < NT; ++t) {
+                    eact[(size_t) e * NT + t] = nact[t];                       // the layer's activation is shared
+                    jobs[(size_t) e].nact[t] = eact[(size_t) e * NT + t].data();
+                    jobs[(size_t) e].out[t] = eout[(size_t) e * NT + t].data();
+                }
+            }
+            const auto before = pool.phase_break();
+            std::vector<double> us;
+            for (int it = 0; it < 30; ++it) {
+                const auto t0 = std::chrono::steady_clock::now();
+                pool.run_split_multi_native(f, jobs.data(), nb_experts);
+                us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+            }
+            const auto after = pool.phase_break();
+            const double ph = std::max(1.0, (double) (after.phases - before.phases));
+            const double pre = (after.pre_park - before.pre_park) * 1000.0 / ph;
+            const double dr = (after.drain - before.drain) * 1000.0 / ph;
+            const double wd = (after.wait_done - before.wait_done) * 1000.0 / ph;
+            const double rp = (after.repark - before.repark) * 1000.0 / ph;
+            std::printf("  %2d experts (%d tokens): %7.1f us   per phase: pre-park %6.1f  host-drain %6.1f  "
+                        "wait-done %6.1f  re-park %6.1f  = %6.1f us hand-offs of %5.1f us phase\n",
+                        nb_experts, NT, med(us), pre, dr, wd, rp, pre + dr + wd + rp, med(us) / ph);
+        }
         // the same cold expert at each active worker count
         std::vector<int> cs;
         for (int k = 1; k < pool.workers(); k *= 2) cs.push_back(k);
