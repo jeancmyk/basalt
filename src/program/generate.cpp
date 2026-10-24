@@ -3084,7 +3084,6 @@ int main(int argc, char** argv) {
                      arena_src.load_gib_per_second());
         srcp = &arena_src;
     }
-    if (basalt::core::diagnostics().memory_report) basalt::core::print_memory_report();
     // the pool is built once the start-up picks are known (below, with the resident RAM plan)
     std::optional<basalt::kernels::cpu::ExpertPool> pool_store;
     uint64_t ram_available_at_plan = 0;   // the available RAM the start-up plan was sized from
