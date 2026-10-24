@@ -320,6 +320,17 @@ int main() {
                 (unsigned long long) (r.locked_bytes >> 10), (unsigned long long) (bytes >> 10), r.note.c_str());
     int fail = !(r.ok && r.locked_bytes == bytes) | fail_keeps;
     basalt::platform::unlock_resident(p, bytes);
+#if defined(_WIN32)
+    // The lock budget is the minimum working set, and only a hard minimum keeps the locked pages from being
+    // trimmed back out: a lock that covered the whole region means the quota call set the minimum as hard.
+    SIZE_T ws_min = 0, ws_max = 0;
+    DWORD ws_flags = 0;
+    const bool hard_min = GetProcessWorkingSetSizeEx(GetCurrentProcess(), &ws_min, &ws_max, &ws_flags) &&
+                          (ws_flags & QUOTA_LIMITS_HARDWS_MIN_ENABLE);
+    std::printf("working set: min=%llu KiB max=%llu KiB hard-min=%d%s\n", (unsigned long long) (ws_min >> 10),
+                (unsigned long long) (ws_max >> 10), (int) hard_min, hard_min ? "" : "   <-- WRONG");
+    fail |= r.ok && !hard_min;
+#endif
     // With a progress callback the lock runs in chunks: the counts only rise and the last one is the whole region.
     std::vector<uint64_t> seen;
     const basalt::platform::LockResult rp =
