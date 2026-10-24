@@ -976,21 +976,18 @@ DxgiMemory print_dxgi_memory_report(const void* luid, bool luid_matched) {
     const DxgiMemory m = dxgi_memory(luid);
 #if defined(_WIN32)
     if (!m.ok) {
-        std::fprintf(stderr, "  dxgi: no adapter reports a video-memory budget\n");
+        basalt::log::raw("  dxgi: no adapter reports a video-memory budget\n");
         return m;
     }
     // Say which adapter the figures came from: matching the device the caller named is the honest case, and taking
     // the first adapter is a guess the reader is entitled to know about.
-    std::fprintf(stderr, "  dxgi adapter: %s\n",
-                 luid_matched ? "matched to the device named" : "the first adapter: no device was named");
-    std::fprintf(stderr, "  dxgi local (device memory): budget %llu MiB, usage %llu MiB, headroom %llu MiB\n",
-                 (unsigned long long) (m.local_budget >> 20), (unsigned long long) (m.local_usage >> 20),
+    basalt::log::raw("  dxgi adapter: %s\n", luid_matched ? "matched to the device named" : "the first adapter: no device was named");
+    basalt::log::raw("  dxgi local (device memory): budget %llu MiB, usage %llu MiB, headroom %llu MiB\n", (unsigned long long) (m.local_budget >> 20), (unsigned long long) (m.local_usage >> 20),
                  (unsigned long long) ((m.local_budget > m.local_usage ? m.local_budget - m.local_usage : 0) >> 20));
-    std::fprintf(stderr, "  dxgi non-local (shared memory): budget %llu MiB, usage %llu MiB, headroom %llu MiB\n",
-                 (unsigned long long) (m.non_local_budget >> 20), (unsigned long long) (m.non_local_usage >> 20),
+    basalt::log::raw("  dxgi non-local (shared memory): budget %llu MiB, usage %llu MiB, headroom %llu MiB\n", (unsigned long long) (m.non_local_budget >> 20), (unsigned long long) (m.non_local_usage >> 20),
                  (unsigned long long) ((m.non_local_budget > m.non_local_usage ? m.non_local_budget - m.non_local_usage : 0) >> 20));
-    if (m.outputs < 0) std::fprintf(stderr, "  dxgi outputs: unknown (the enumeration failed)\n");
-    else std::fprintf(stderr, "  dxgi outputs: %d\n", m.outputs);
+    if (m.outputs < 0) basalt::log::raw("  dxgi outputs: unknown (the enumeration failed)\n");
+    else basalt::log::raw("  dxgi outputs: %d\n", m.outputs);
 #else
     (void) luid;
     (void) luid_matched;   // nothing budgets video memory here, and the figures say so

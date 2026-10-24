@@ -390,27 +390,24 @@ HostRegisterProbe probe_host_register(uint64_t slice_bytes, uint64_t max_bytes) 
 }
 
 void print_memory_report(const ReportFacts& facts) {
-    std::fprintf(stderr, "basalt memory-report:\n");
+    basalt::log::raw("basalt memory-report:\n");
     // Every figure comes from the platform probe, so one line reads out the same way on both platforms: what the OS
     // has, what it can still hand out, and what it can still commit - the pair a page-locked arena must fit inside.
     // A probe that did not answer says so rather than printing zeros.
     const uint64_t phys_total = basalt::platform::total_physical_memory();
     if (phys_total == 0) {
-        std::fprintf(stderr, "  host: unknown (the OS gave no memory reading)\n");
+        basalt::log::raw("  host: unknown (the OS gave no memory reading)\n");
     } else {
-        std::fprintf(stderr, "  host: total phys %llu MiB, avail phys %llu MiB, commit limit %llu MiB, commit headroom %llu MiB\n",
-                     (unsigned long long) (phys_total >> 20),
+        basalt::log::raw("  host: total phys %llu MiB, avail phys %llu MiB, commit limit %llu MiB, commit headroom %llu MiB\n", (unsigned long long) (phys_total >> 20),
                      (unsigned long long) (basalt::platform::available_memory() >> 20),
                      (unsigned long long) (basalt::platform::commit_limit() >> 20),
                      (unsigned long long) (basalt::platform::commit_headroom() >> 20));
     }
     const basalt::platform::ProcessMemory pmem = basalt::platform::process_memory();
-    std::fprintf(stderr, "  process: resident %llu MiB, peak resident %llu MiB, private %llu MiB\n",
-                 pmem.rss_mib, pmem.peak_rss_mib, pmem.private_mib);
+    basalt::log::raw("  process: resident %llu MiB, peak resident %llu MiB, private %llu MiB\n", pmem.rss_mib, pmem.peak_rss_mib, pmem.private_mib);
     uint64_t ws_min = 0, ws_max = 0;
     if (basalt::platform::working_set_quota(ws_min, ws_max))
-        std::fprintf(stderr, "  working set quota: min %llu MiB, max %llu MiB\n",
-                     (unsigned long long) (ws_min >> 20), (unsigned long long) (ws_max >> 20));
+        basalt::log::raw("  working set quota: min %llu MiB, max %llu MiB\n", (unsigned long long) (ws_min >> 20), (unsigned long long) (ws_max >> 20));
     if (g_report_arena) {
         const char* backing = "unknown";
         switch (g_report_arena->backing) {
@@ -419,49 +416,41 @@ void print_memory_report(const ReportFacts& facts) {
             case PageBacking::PinnedByCuda: backing = "pinned by cuda"; break;
         }
         if (g_report_arena->slice_bytes == 0) {
-            std::fprintf(stderr, "  arena: capacity %llu MiB, backing %s, registered %llu MiB (whole), locked %llu MiB\n",
-                         (unsigned long long) (g_report_arena->capacity >> 20), backing,
+            basalt::log::raw("  arena: capacity %llu MiB, backing %s, registered %llu MiB (whole), locked %llu MiB\n", (unsigned long long) (g_report_arena->capacity >> 20), backing,
                          (unsigned long long) (g_report_arena->registered_bytes >> 20),
                          (unsigned long long) (g_report_arena->locked_bytes >> 20));
         } else {
-            std::fprintf(stderr, "  arena: capacity %llu MiB, backing %s, registered %llu MiB (%d slices of %llu MiB), locked %llu MiB\n",
-                         (unsigned long long) (g_report_arena->capacity >> 20), backing,
+            basalt::log::raw("  arena: capacity %llu MiB, backing %s, registered %llu MiB (%d slices of %llu MiB), locked %llu MiB\n", (unsigned long long) (g_report_arena->capacity >> 20), backing,
                          (unsigned long long) (g_report_arena->registered_bytes >> 20), g_report_arena->registered_slices,
                          (unsigned long long) (g_report_arena->slice_bytes >> 20),
                          (unsigned long long) (g_report_arena->locked_bytes >> 20));
         }
-        std::fprintf(stderr, "  arena note: %s\n", g_report_arena->note.empty() ? "(none)" : g_report_arena->note.c_str());
+        basalt::log::raw("  arena note: %s\n", g_report_arena->note.empty() ? "(none)" : g_report_arena->note.c_str());
     } else {
-        std::fprintf(stderr, "  arena: none recorded\n");
+        basalt::log::raw("  arena: none recorded\n");
     }
     // What the large-page pool would grant, once: a pool that declines an arena can still fund part of one. A
     // privilege the token does not hold is the session's ceiling rather than the pool's, so it is named as such.
     {
         const basalt::platform::LargePageProbe lp = large_page_probe_once();
         if (lp.minimum == 0) {
-            std::fprintf(stderr, "  large pages: none on this system\n");
+            basalt::log::raw("  large pages: none on this system\n");
         } else if (lp.granted > 0) {
-            std::fprintf(stderr, "  large pages: minimum %llu MiB, the pool grants %llu MiB of the %llu MiB requested"
-                                 " (%llu of %llu addresses of the grant read back as large pages)\n",
-                         (unsigned long long) (lp.minimum >> 20), (unsigned long long) (lp.granted >> 20),
+            basalt::log::raw("  large pages: minimum %llu MiB, the pool grants %llu MiB of the %llu MiB requested" " (%llu of %llu addresses of the grant read back as large pages)\n", (unsigned long long) (lp.minimum >> 20), (unsigned long long) (lp.granted >> 20),
                          (unsigned long long) (lp.requested >> 20), (unsigned long long) lp.large_pages,
                          (unsigned long long) lp.sampled);
         } else if (lp.error == 1314) {
-            std::fprintf(stderr, "  large pages: minimum %llu MiB, the token does not hold the privilege (1314), so "
-                                 "none of the %llu MiB requested was granted - the session's ceiling, not the pool's\n",
-                         (unsigned long long) (lp.minimum >> 20), (unsigned long long) (lp.requested >> 20));
+            basalt::log::raw("  large pages: minimum %llu MiB, the token does not hold the privilege (1314), so " "none of the %llu MiB requested was granted - the session's ceiling, not the pool's\n", (unsigned long long) (lp.minimum >> 20), (unsigned long long) (lp.requested >> 20));
         } else {
-            std::fprintf(stderr, "  large pages: minimum %llu MiB, the pool grants none of the %llu MiB requested "
-                                 "(error %llu)\n", (unsigned long long) (lp.minimum >> 20),
+            basalt::log::raw("  large pages: minimum %llu MiB, the pool grants none of the %llu MiB requested " "(error %llu)\n", (unsigned long long) (lp.minimum >> 20),
                          (unsigned long long) (lp.requested >> 20), (unsigned long long) lp.error);
         }
     }
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
-        std::fprintf(stderr, "  vram: free %llu MiB / total %llu MiB (cudaMemGetInfo)\n",
-                     (unsigned long long) (free_b >> 20), (unsigned long long) (total_b >> 20));
+        basalt::log::raw("  vram: free %llu MiB / total %llu MiB (cudaMemGetInfo)\n", (unsigned long long) (free_b >> 20), (unsigned long long) (total_b >> 20));
     else
-        std::fprintf(stderr, "  vram: unknown (cudaMemGetInfo failed)\n");
+        basalt::log::raw("  vram: unknown (cudaMemGetInfo failed)\n");
     // The budget that matters is the one the process is charged against, so the query is matched to the device
     // being reported on. When the driver gives no id there is nothing to match, and the figures are the first
     // adapter's - said on the line rather than passed off as the device's. Where the OS budgets no video memory
@@ -471,41 +460,29 @@ void print_memory_report(const ReportFacts& facts) {
     // Device memory is charged to the LOCAL segment and page-locked memory the GPU maps to the shared (NON_LOCAL)
     // one, so each plan is compared against its own budget and every verdict names the segment it is about.
     if (!facts.tier_known) {
-        std::fprintf(stderr, "  tier: unknown (no expert-tier facts recorded)\n");
+        basalt::log::raw("  tier: unknown (no expert-tier facts recorded)\n");
     } else if (facts.tier_bytes == 0) {
-        std::fprintf(stderr, "  tier: none (no expert cache)\n");
+        basalt::log::raw("  tier: none (no expert cache)\n");
     } else if (!dx.ok) {
-        std::fprintf(stderr, "  tier: %llu MiB in %llu slots (full %llu MiB), charged to the LOCAL segment; the local "
-                             "budget is unknown, so it cannot be compared\n",
-                     (unsigned long long) (facts.tier_bytes >> 20), (unsigned long long) facts.tier_slots,
+        basalt::log::raw("  tier: %llu MiB in %llu slots (full %llu MiB), charged to the LOCAL segment; the local " "budget is unknown, so it cannot be compared\n", (unsigned long long) (facts.tier_bytes >> 20), (unsigned long long) facts.tier_slots,
                      (unsigned long long) (facts.tier_full_bytes >> 20));
     } else if (dx.local_usage > dx.local_budget) {
-        std::fprintf(stderr, "  tier: %llu MiB in %llu slots (full %llu MiB), charged to the LOCAL segment: usage is "
-                             "over the local budget by %llu MiB, so the driver can place that much in system memory\n",
-                     (unsigned long long) (facts.tier_bytes >> 20), (unsigned long long) facts.tier_slots,
+        basalt::log::raw("  tier: %llu MiB in %llu slots (full %llu MiB), charged to the LOCAL segment: usage is " "over the local budget by %llu MiB, so the driver can place that much in system memory\n", (unsigned long long) (facts.tier_bytes >> 20), (unsigned long long) facts.tier_slots,
                      (unsigned long long) (facts.tier_full_bytes >> 20),
                      (unsigned long long) ((dx.local_usage - dx.local_budget) >> 20));
     } else {
-        std::fprintf(stderr, "  tier: %llu MiB in %llu slots (full %llu MiB), charged to the LOCAL segment: within the "
-                             "local budget, %llu MiB of headroom left\n",
-                     (unsigned long long) (facts.tier_bytes >> 20), (unsigned long long) facts.tier_slots,
+        basalt::log::raw("  tier: %llu MiB in %llu slots (full %llu MiB), charged to the LOCAL segment: within the " "local budget, %llu MiB of headroom left\n", (unsigned long long) (facts.tier_bytes >> 20), (unsigned long long) facts.tier_slots,
                      (unsigned long long) (facts.tier_full_bytes >> 20),
                      (unsigned long long) ((dx.local_budget - dx.local_usage) >> 20));
     }
     if (g_report_arena != nullptr && g_report_arena->registered_bytes > 0) {
         if (!dx.ok) {
-            std::fprintf(stderr, "  arena charge: %llu MiB registered, charged to the shared (NON_LOCAL) segment; that "
-                                 "budget is unknown\n",
-                         (unsigned long long) (g_report_arena->registered_bytes >> 20));
+            basalt::log::raw("  arena charge: %llu MiB registered, charged to the shared (NON_LOCAL) segment; that " "budget is unknown\n", (unsigned long long) (g_report_arena->registered_bytes >> 20));
         } else if (dx.non_local_usage > dx.non_local_budget) {
-            std::fprintf(stderr, "  arena charge: %llu MiB registered, charged to the shared (NON_LOCAL) segment: usage "
-                                 "is over the non-local budget by %llu MiB\n",
-                         (unsigned long long) (g_report_arena->registered_bytes >> 20),
+            basalt::log::raw("  arena charge: %llu MiB registered, charged to the shared (NON_LOCAL) segment: usage " "is over the non-local budget by %llu MiB\n", (unsigned long long) (g_report_arena->registered_bytes >> 20),
                          (unsigned long long) ((dx.non_local_usage - dx.non_local_budget) >> 20));
         } else {
-            std::fprintf(stderr, "  arena charge: %llu MiB registered, charged to the shared (NON_LOCAL) segment: within "
-                                 "the non-local budget, %llu MiB of headroom left\n",
-                         (unsigned long long) (g_report_arena->registered_bytes >> 20),
+            basalt::log::raw("  arena charge: %llu MiB registered, charged to the shared (NON_LOCAL) segment: within " "the non-local budget, %llu MiB of headroom left\n", (unsigned long long) (g_report_arena->registered_bytes >> 20),
                          (unsigned long long) ((dx.non_local_budget - dx.non_local_usage) >> 20));
         }
     }
@@ -513,26 +490,23 @@ void print_memory_report(const ReportFacts& facts) {
     {
         const basalt::platform::IoStats io = basalt::platform::io_stats();
         if (io.issuing_threads == 0 && io.submitted == 0) {
-            std::fprintf(stderr, "  io: no reader open\n");
+            basalt::log::raw("  io: no reader open\n");
         } else {
-            std::fprintf(stderr, "  io: %d issuing threads, %llu queued, %llu in flight (peak %llu), %llu submitted, "
-                                 "%llu completed (%llu failed), %llu MiB\n",
-                         io.issuing_threads, (unsigned long long) io.queued, (unsigned long long) io.inflight,
+            basalt::log::raw("  io: %d issuing threads, %llu queued, %llu in flight (peak %llu), %llu submitted, " "%llu completed (%llu failed), %llu MiB\n", io.issuing_threads, (unsigned long long) io.queued, (unsigned long long) io.inflight,
                          (unsigned long long) io.peak_inflight, (unsigned long long) io.submitted,
                          (unsigned long long) io.completed, (unsigned long long) io.failed,
                          (unsigned long long) (io.bytes >> 20));
         }
     }
-    if (!facts.ple_io.empty()) std::fprintf(stderr, "  io note: %s\n", facts.ple_io.c_str());
+    if (!facts.ple_io.empty()) basalt::log::raw("  io note: %s\n", facts.ple_io.c_str());
     // The two one-time probes. A probe that could not run says so: an unmeasured rate is not a zero.
     {
         const H2dProbe h2d = h2d_probe_once();
         if (h2d.ok) {
-            std::fprintf(stderr, "  probe h2d: %.1f GiB/s from the registered arena in %llu MiB chunks (%llu MiB "
-                                 "moved)\n", h2d.gib_per_s, (unsigned long long) (h2d.chunk >> 20),
+            basalt::log::raw("  probe h2d: %.1f GiB/s from the registered arena in %llu MiB chunks (%llu MiB " "moved)\n", h2d.gib_per_s, (unsigned long long) (h2d.chunk >> 20),
                          (unsigned long long) (h2d.bytes >> 20));
         } else {
-            std::fprintf(stderr, "  probe h2d: not measured (no registered arena)\n");
+            basalt::log::raw("  probe h2d: not measured (no registered arena)\n");
         }
     }
     // The small-read arms: the same file, size and count at two queue depths, measured once before any view of the
@@ -541,11 +515,10 @@ void print_memory_report(const ReportFacts& facts) {
         auto arm = [](const ReportFacts::ReadArm& a) {
             for (const basalt::platform::ReadProbe* p : {&a.shallow, &a.deep}) {
                 if (p->ok)
-                    std::fprintf(stderr, "  probe reads (%s) %u B, depth %u: %.0f reads/s, %.1f MiB/s, %llu failed\n",
-                                 a.note.c_str(), p->read_bytes, p->depth, p->reads_per_s(),
+                    basalt::log::raw("  probe reads (%s) %u B, depth %u: %.0f reads/s, %.1f MiB/s, %llu failed\n", a.note.c_str(), p->read_bytes, p->depth, p->reads_per_s(),
                                  p->gib_per_s() * 1024.0, (unsigned long long) p->failed);
                 else
-                    std::fprintf(stderr, "  probe reads (%s) depth %u: not measured%s%s\n", a.note.c_str(), p->depth,
+                    basalt::log::raw("  probe reads (%s) depth %u: not measured%s%s\n", a.note.c_str(), p->depth,
                                  p->error.empty() ? "" : ": ", p->error.c_str());
             }
         };
@@ -557,27 +530,23 @@ void print_memory_report(const ReportFacts& facts) {
     // today, and this says whether the driver really allows that much.
     if (facts.host_register.ok) {
         const HostRegisterProbe& h = facts.host_register;
-        std::fprintf(stderr, "  probe host register: %u slices of %llu MiB accepted = %llu MiB%s\n", h.slices,
+        basalt::log::raw("  probe host register: %u slices of %llu MiB accepted = %llu MiB%s\n", h.slices,
                      (unsigned long long) (h.slice_bytes >> 20), (unsigned long long) (h.granted >> 20),
                      h.refused_at > 0 ? " (the driver refused the next one)" : "");
-        if (h.refused_at > 0) std::fprintf(stderr, "  probe host register refusal: %s\n", h.error.c_str());
+        if (h.refused_at > 0) basalt::log::raw("  probe host register refusal: %s\n", h.error.c_str());
         if (h.formula_bytes > 0 || h.budget_bytes > 0) {
             // The margin matters more than the verdict: it is how much of the pinned ceiling the formula leaves unused.
             const bool more = h.granted >= h.formula_bytes;
             const uint64_t margin = more ? h.granted - h.formula_bytes : h.formula_bytes - h.granted;
             if (h.formula_bytes == 0)
-                std::fprintf(stderr, "  probe host register vs the caps: the formula is not computable, DXGI shared "
-                                     "budget %llu MiB\n", (unsigned long long) (h.budget_bytes >> 20));
+                basalt::log::raw("  probe host register vs the caps: the formula is not computable, DXGI shared " "budget %llu MiB\n", (unsigned long long) (h.budget_bytes >> 20));
             else
-                std::fprintf(stderr, "  probe host register vs the caps: the driver allows %llu MiB %s the RAM/2-8GiB "
-                                     "formula (%llu MiB), and the DXGI shared budget is %llu MiB\n",
-                             (unsigned long long) (margin >> 20), more ? "more than" : "less than",
+                basalt::log::raw("  probe host register vs the caps: the driver allows %llu MiB %s the RAM/2-8GiB " "formula (%llu MiB), and the DXGI shared budget is %llu MiB\n", (unsigned long long) (margin >> 20), more ? "more than" : "less than",
                              (unsigned long long) (h.formula_bytes >> 20),
                              (unsigned long long) (h.budget_bytes >> 20));
         }
     } else {
-        std::fprintf(stderr, "  probe host register: not measured%s%s\n",
-                     facts.host_register.error.empty() ? "" : ": ", facts.host_register.error.c_str());
+        basalt::log::raw("  probe host register: not measured%s%s\n", facts.host_register.error.empty() ? "" : ": ", facts.host_register.error.c_str());
     }
     // What the token says about the large-page privilege, and what the two documented allocation forms do with it.
     // A 1314 refusal has to be read against all of it: absent from the token, present but refused by the allocation,
@@ -585,19 +554,15 @@ void print_memory_report(const ReportFacts& facts) {
     {
         const basalt::platform::LargePagePrivilege lp = basalt::platform::probe_large_page_privilege();
         if (lp.ok) {
-            std::fprintf(stderr, "  large-page privilege: looked up %s, present %s, enabled %s; token elevated %s, "
-                                 "integrity 0x%llx, Administrators %s%s\n",
-                         lp.looked_up ? "yes" : "no", lp.present ? "yes" : "no", lp.enabled ? "yes" : "no",
+            basalt::log::raw("  large-page privilege: looked up %s, present %s, enabled %s; token elevated %s, " "integrity 0x%llx, Administrators %s%s\n", lp.looked_up ? "yes" : "no", lp.present ? "yes" : "no", lp.enabled ? "yes" : "no",
                          lp.elevated ? "yes" : "no", (unsigned long long) lp.integrity_rid,
                          lp.admin_group ? "present" : "absent",
                          lp.admin_deny_only ? " (deny-only: a filtered token)" : "");
-            std::fprintf(stderr, "  large-page privilege allocations: one page reserve+commit %s (error %llu), reserve "
-                                 "%s (error %llu), then commit large %s (error %llu)\n",
-                         lp.single_ok ? "succeeded" : "FAILED", (unsigned long long) lp.single_error,
+            basalt::log::raw("  large-page privilege allocations: one page reserve+commit %s (error %llu), reserve " "%s (error %llu), then commit large %s (error %llu)\n", lp.single_ok ? "succeeded" : "FAILED", (unsigned long long) lp.single_error,
                          lp.reserve_ok ? "succeeded" : "FAILED", (unsigned long long) lp.reserve_error,
                          lp.commit_ok ? "succeeded" : "FAILED", (unsigned long long) lp.commit_error);
         } else {
-            std::fprintf(stderr, "  large-page privilege: not read%s%s\n", lp.note.empty() ? "" : ": ", lp.note.c_str());
+            basalt::log::raw("  large-page privilege: not read%s%s\n", lp.note.empty() ? "" : ": ", lp.note.c_str());
         }
     }
     // What the OS prefetch hint buys on a mapped view: the cost of faulting a window with and without it, and with
@@ -605,27 +570,20 @@ void print_memory_report(const ReportFacts& facts) {
     if (facts.view_faults.ok) {
         const basalt::platform::ViewFaultProbe& f = facts.view_faults;
         const double off_ms = f.off_seconds * 1000.0, on_ms = f.on_seconds * 1000.0, early_ms = f.early_seconds * 1000.0;
-        std::fprintf(stderr, "  probe view faults: %llu MiB x %u windows per arm: no hint %.1f ms (%.3f ms/MiB), "
-                             "hint %.1f ms (%.3f ms/MiB), hint then %.0f ms of other work %.1f ms (%.3f ms/MiB); "
-                             "hint/no-hint %.2fx, early/no-hint %.2fx\n",
-                     (unsigned long long) (f.window_bytes >> 20), f.windows_per_arm, off_ms, f.off_ms_per_mib(), on_ms,
+        basalt::log::raw("  probe view faults: %llu MiB x %u windows per arm: no hint %.1f ms (%.3f ms/MiB), " "hint %.1f ms (%.3f ms/MiB), hint then %.0f ms of other work %.1f ms (%.3f ms/MiB); " "hint/no-hint %.2fx, early/no-hint %.2fx\n", (unsigned long long) (f.window_bytes >> 20), f.windows_per_arm, off_ms, f.off_ms_per_mib(), on_ms,
                      f.on_ms_per_mib(), f.wait_ms, early_ms, f.early_ms_per_mib(), off_ms > 0.0 ? on_ms / off_ms : 0.0,
                      off_ms > 0.0 ? early_ms / off_ms : 0.0);
         // The wait is real time, so the early arm is only a win if it survives it: the comparison that matters is the
         // wait plus the timed fault against the unhinted fault, not the two timed regions against each other.
         const double early_e2e = early_ms + f.wait_ms;
-        std::fprintf(stderr, "  probe view faults end to end: unhinted %.1f ms, unhinted WITH the hint %.1f ms, "
-                             "hinted early %.1f ms (%.1f ms of it the wait) = %.2fx against unhinted\n",
-                     off_ms, on_ms, early_e2e, f.wait_ms, off_ms > 0.0 ? early_e2e / off_ms : 0.0);
+        basalt::log::raw("  probe view faults end to end: unhinted %.1f ms, unhinted WITH the hint %.1f ms, " "hinted early %.1f ms (%.1f ms of it the wait) = %.2fx against unhinted\n", off_ms, on_ms, early_e2e, f.wait_ms, off_ms > 0.0 ? early_e2e / off_ms : 0.0);
         auto spread = [](double mean, double lo, double hi) { return mean > 0.0 && hi - lo > 0.2 * mean; };
         if (spread(f.off_seconds, f.off_min, f.off_max) || spread(f.on_seconds, f.on_min, f.on_max) ||
             spread(f.early_seconds, f.early_min, f.early_max))
-            std::fprintf(stderr, "  probe view faults spread: no hint %.1f-%.1f ms, hint %.1f-%.1f ms, early %.1f-%.1f "
-                                 "ms\n", f.off_min * 1000.0, f.off_max * 1000.0, f.on_min * 1000.0, f.on_max * 1000.0,
+            basalt::log::raw("  probe view faults spread: no hint %.1f-%.1f ms, hint %.1f-%.1f ms, early %.1f-%.1f " "ms\n", f.off_min * 1000.0, f.off_max * 1000.0, f.on_min * 1000.0, f.on_max * 1000.0,
                          f.early_min * 1000.0, f.early_max * 1000.0);
     } else {
-        std::fprintf(stderr, "  probe view faults: not measured%s%s\n",
-                     facts.view_faults.error.empty() ? "" : ": ", facts.view_faults.error.c_str());
+        basalt::log::raw("  probe view faults: not measured%s%s\n", facts.view_faults.error.empty() ? "" : ": ", facts.view_faults.error.c_str());
     }
 }
 

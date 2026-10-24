@@ -3180,8 +3180,8 @@ int main(int argc, char** argv) {
             // Only a platform that budgets video memory per process can have that budget be unavailable: elsewhere
             // the query is not made at all, and saying so on every start would be noise rather than information.
             if (basalt::platform::budgets_video_memory() && o.vram_reserve_given && !reserve_clamp_said) {
-                std::fprintf(stderr, "basalt generate: the LOCAL budget is unavailable, so --vram-reserve-mib %d was "
-                                     "not capped by it\n", o.vram_reserve_mib);
+                basalt::log::info("basalt generate", "the LOCAL budget is unavailable, so --vram-reserve-mib %d was "
+                                     "not capped by it", o.vram_reserve_mib);
                 reserve_clamp_said = true;
             }
             return;
@@ -3196,8 +3196,8 @@ int main(int argc, char** argv) {
         const int mib = (int) (got >> 20);
         if (mib == o.vram_reserve_mib) return;
         if (!reserve_clamp_said) {
-            std::fprintf(stderr, "basalt generate: --vram-reserve-mib %d leaves more VRAM free than the LOCAL budget "
-                                 "has (%llu MiB of %llu MiB budget in use, %llu MiB left%s), so the reserve is %d MiB%s\n",
+            basalt::log::info("basalt generate", "--vram-reserve-mib %d leaves more VRAM free than the LOCAL budget "
+                                 "has (%llu MiB of %llu MiB budget in use, %llu MiB left%s), so the reserve is %d MiB%s",
                          o.vram_reserve_mib, (unsigned long long) (local_usage >> 20),
                          (unsigned long long) (local_budget >> 20), (unsigned long long) (plan_free >> 20),
                          keep_bytes > 0 ? (", and the plan keeps " + std::to_string(keep_bytes >> 20) + " MiB of it").c_str() : "",
@@ -3518,10 +3518,10 @@ int main(int argc, char** argv) {
             if (!shrink_to(keep_bytes)) break;
         }
         if (spill_seen > 0 && o.expert_cache > 0)
-            std::fprintf(stderr, "basalt warning: the expert cache may still be partly in system memory (%lld MiB did "
+            basalt::log::warn("basalt", "the expert cache may still be partly in system memory (%lld MiB did "
                                  "not fit in device memory): it will be slow. The driver's sysmem fallback policy "
                                  "(Prefer No Sysmem Fallback for this executable) turns that into a failed allocation "
-                                 "instead of a quiet slowdown\n", (long long) (spill_seen >> 20));
+                                 "instead of a quiet slowdown", (long long) (spill_seen >> 20));
         if (failed > 0 && o.expert_cache > 0)
             basalt::log::warn("basalt generate", "expert cache: %d slots (%.2f GiB) after %d smaller tries - a bigger "
                                  "page file lets it use more of the free VRAM",
