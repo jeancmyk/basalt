@@ -898,11 +898,10 @@ void gdn_dump_pair(const char* tag, const void* slot, const void* state, size_t 
         }
         if (f != nullptr) std::fclose(f);
         (void) cudaGetLastError();
-        std::fprintf(stderr, "basalt serve: GDN %s dump failed (%s)\n", tag, path.c_str());
+        basalt::log::error("basalt serve", "GDN %s dump failed (%s)", tag, path.c_str());
         return;
     }
-    std::fprintf(stderr, "basalt serve: GDN %s: .slot and .state written beside %s (%zu bytes each)\n", tag,
-                 g_gdn_dump_base.c_str(), bytes);
+    basalt::log::info("basalt serve", "GDN %s: .slot and .state written beside %s (%zu bytes each)", tag, g_gdn_dump_base.c_str(), bytes);
 }
 
 /// Copies the running state out (this session's carve only).  The caller has synchronized the device.
@@ -920,7 +919,7 @@ bool checkpoint_restore(const ConvCheckpoint& c, basalt::core::SessionState& ss,
     if (basalt::core::diagnostics().profile) {   // which copy the state comes from: a slot is D2D, else host bytes
         const std::string where = c.gdn_slot.index() >= 0
                                           ? "slot " + std::to_string(c.gdn_slot.index()) + " (D2D)" : "host bytes";
-        std::fprintf(stderr, "basalt serve: checkpoint restore at %lld: %s\n", (long long) c.ids.size(), where.c_str());
+        basalt::log::info("basalt serve", "checkpoint restore at %lld: %s", (long long) c.ids.size(), where.c_str());
     }
     if (basalt::core::conversation_checkpoint_restore(c, ss, g, error, slot)) {
         if (slot != nullptr) gdn_dump_pair("restore", slot, ss.gdn_state, g_gdn_dump_bytes);   // right after the copy
@@ -940,7 +939,7 @@ bool checkpoint_materialise(ConvCheckpoint& c, size_t gdn_bytes) {
     c.gdn.resize(gdn_bytes);
     const cudaError_t e = cudaMemcpy(c.gdn.data(), src, gdn_bytes, cudaMemcpyDeviceToHost);
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "basalt serve: checkpoint slot copy: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt serve", "checkpoint slot copy: %s", cudaGetErrorString(e));
         c.gdn.clear();
         return false;
     }
@@ -960,7 +959,7 @@ bool checkpoint_clone(ConvCheckpoint& dst, const ConvCheckpoint& src, size_t gdn
     dst.gdn.resize(gdn_bytes);
     const cudaError_t e = cudaMemcpy(dst.gdn.data(), slot, gdn_bytes, cudaMemcpyDeviceToHost);
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "basalt serve: checkpoint slot copy: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt serve", "checkpoint slot copy: %s", cudaGetErrorString(e));
         dst.gdn.clear();
         return false;
     }
@@ -5751,13 +5750,14 @@ int main(int argc, char** argv) {
                 gdn_state_bytes = zz.gdn;
                 size_t free_b = 0, total_b = 0;
                 (void) cudaMemGetInfo(&free_b, &total_b);
-                std::fprintf(stderr, "basalt serve: GDN state pool: %d slots x %.0f MiB = %.0f MiB, %.0f MiB device "
-                                     "memory free after it\n", g_gdn_slots.slots(), (double) zz.gdn / 1048576.0,
-                             (double) g_gdn_slots.bytes() / 1048576.0, (double) free_b / 1048576.0);
+                basalt::log::info("basalt serve", "GDN state pool: %d slots x %.0f MiB = %.0f MiB, %.0f MiB device "
+                                     "memory free after it",
+                                  g_gdn_slots.slots(), (double) zz.gdn / 1048576.0,
+                                  (double) g_gdn_slots.bytes() / 1048576.0, (double) free_b / 1048576.0);
             } else if (o.prompt_cache > 0 && stages.empty()) {
-                std::fprintf(stderr, "basalt serve: GDN state pool off (%s): checkpoints keep host bytes and a hit "
-                                     "copies over the host\n",
-                             se.empty() ? "no GDN layers, no device memory, or a layer split" : se.c_str());
+                basalt::log::info("basalt serve", "GDN state pool off (%s): checkpoints keep host bytes and a hit "
+                                     "copies over the host",
+                                  se.empty() ? "no GDN layers, no device memory, or a layer split" : se.c_str());
             }
         }
         // --dump-gdn: the per-request state file, plus the byte-exact pair each slot copy writes beside it
@@ -5795,7 +5795,7 @@ int main(int argc, char** argv) {
             // drop the park rather than publish an image whose slot the pool may hand out again.
             for (ConvCheckpoint& c : checks)
                 if (!checkpoint_materialise(c, gdn_state_bytes)) {
-                    std::fprintf(stderr, "basalt serve: conversation cache: skip parking (materialise)\n");
+                    basalt::log::warn("basalt serve", "conversation cache: skip parking (materialise)");
                     return true;
                 }
             // before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold nothing
@@ -5985,7 +5985,7 @@ int main(int argc, char** argv) {
                     const std::string where = c.gdn_slot.index() >= 0
                                                       ? "slot " + std::to_string(c.gdn_slot.index()) + " (D2D)"
                                                       : "host bytes";
-                    std::fprintf(stderr, "basalt serve: checkpoint save at %lld: %s\n", (long long) L, where.c_str());
+                    basalt::log::info("basalt serve", "checkpoint save at %lld: %s", (long long) L, where.c_str());
                 }
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const basalt::core::OnDevice on(st->dev);
@@ -8925,8 +8925,7 @@ int main(int argc, char** argv) {
                             checks.back().used = ++check_clock;
                         } else {
                             // the slot's state could not be read out: the checkpoint is dropped, the read goes on
-                            std::fprintf(stderr, "basalt serve: conversation cache: slot checkpoint dropped "
-                                                 "(clone)\n");
+                            basalt::log::warn("basalt serve", "conversation cache: slot checkpoint dropped (clone)");
                         }
                     } else {
                         live = bs[(size_t) slot_source].ids;
@@ -10740,11 +10739,10 @@ int main(int argc, char** argv) {
                 if (f != nullptr && cudaMemcpy(host.data(), rsp->gdn_state, bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
                     std::fwrite(host.data(), 1, bytes, f) == bytes) {
                     std::fclose(f);
-                    std::fprintf(stderr, "basalt serve: GDN state dumped: %zu bytes after %zu tokens -> %s\n", bytes,
-                                 consumed.size(), o.dump_gdn.c_str());
+                    basalt::log::info("basalt serve", "GDN state dumped: %zu bytes after %zu tokens -> %s", bytes, consumed.size(), o.dump_gdn.c_str());
                 } else {
                     if (f != nullptr) std::fclose(f);
-                    std::fprintf(stderr, "basalt serve: GDN state dump failed: %s\n", o.dump_gdn.c_str());
+                    basalt::log::error("basalt serve", "GDN state dump failed: %s", o.dump_gdn.c_str());
                 }
             }
             if (dec_timing && dec_windows > 0) {
