@@ -159,6 +159,21 @@ LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_byte
     return load_experts_ranges(path, dst, off, n, threads, chunk);
 }
 
+LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
+                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk, uint64_t base) {
+    LoadStats st;
+    st.ok = false;
+    (void) path; (void) dst; (void) layer_off; (void) layer_bytes; (void) threads; (void) chunk; (void) base;
+    return st;
+}
+
+bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_bytes, std::string& why,
+                        bool cache_counts, uint64_t read_bytes) {
+    (void) files; (void) arena_bytes; (void) cache_counts; (void) read_bytes;
+    why = "buffered";
+    return false;
+}
+
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk, uint64_t base) {
     LoadStats st;

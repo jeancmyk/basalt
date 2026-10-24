@@ -97,6 +97,25 @@ LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_byte
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk, uint64_t base = 0);
 
+/// The same ranges read UNBUFFERED straight into `dst`: no staging buffer and no file-cache copy - the drive's DMA
+/// lands where the experts live. Every range, `dst` and `chunk` must be 4 KiB aligned; returns ok = false with an
+/// empty `error` when they are not (or where unbuffered reads are not available), and the caller falls back to
+/// load_experts_ranges.
+LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
+                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk, uint64_t base = 0);
+
+/// Whether the expert files are better read unbuffered (false on this platform): a timed probe of random 64 KiB reads
+/// says they are not in the OS file cache, and the RAM left beside the arena (`arena_bytes`) could not keep them cached
+/// for the next start either - so a warm restart never gets slower, and only a start that reads the drive anyway skips
+/// the cache's copy.  `why` says what decided.
+/// `cache_counts` false (the file tier with a RAM budget): only whether the files could be kept decides - their mapped
+/// pages land in the process's working set, so a partly cached file would still take the RAM the budget was sized for.
+/// `read_bytes`: the bytes the files are read for, when that is less than the files (the file tier reads only the
+/// experts outside its RAM copy); `kAllFileBytes` = every byte of `files`.  See platform::file_cache_keeps.
+constexpr uint64_t kAllFileBytes = ~0ull;
+bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_bytes, std::string& why,
+                        bool cache_counts = true, uint64_t read_bytes = kAllFileBytes);
+
 /// Record the arena the memory report describes (may be null).  Called where the arena is created.
 void set_report_arena(PinnedArena* arena);
 
