@@ -321,8 +321,9 @@ int main() {
     int fail = !(r.ok && r.locked_bytes == bytes) | fail_keeps;
     basalt::platform::unlock_resident(p, bytes);
 #if defined(_WIN32)
-    // The lock budget is the minimum working set, and only a hard minimum keeps the locked pages from being
-    // trimmed back out: a lock that covered the whole region means the quota call set the minimum as hard.
+    // A successful lock proves nothing on its own: an elevated token locks the region with a soft minimum too. The
+    // flag readback is what shows the quota call set the minimum as hard, and only a hard minimum keeps the locked
+    // pages from being trimmed back out.
     SIZE_T ws_min = 0, ws_max = 0;
     DWORD ws_flags = 0;
     const bool hard_min = GetProcessWorkingSetSizeEx(GetCurrentProcess(), &ws_min, &ws_max, &ws_flags) &&
