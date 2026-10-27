@@ -10870,8 +10870,8 @@ int main(int argc, char** argv) {
                         }
                     if (root != nullptr && root != best) {   // the slot's chain gets host bytes, never an index the pool may reuse
                         ConvCheckpoint copy = *root;
-                        if (checkpoint_materialise(copy, gdn_state_bytes)) sl.checks.push_back(std::move(copy));
-                        else basalt::log::warn("basalt batch", "slot %d keeps no checkpoint (materialise)", admit_slot);
+                        if (checkpoint_clone(copy, *root, gdn_state_bytes)) sl.checks.push_back(std::move(copy));
+                        else basalt::log::warn("basalt batch", "slot %d keeps no checkpoint (clone)", admit_slot);
                     }
                     if (best != nullptr) {
                         ConvCheckpoint copy = *best;
