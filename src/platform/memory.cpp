@@ -92,7 +92,7 @@ LockResult lock_resident(void* p, uint64_t bytes, const LockProgress& progress) 
     if (p == nullptr || bytes == 0) { r.note = "nothing to lock"; return r; }
 #if defined(_WIN32)
     enable_privilege(L"SeIncreaseWorkingSetPrivilege");   // to raise this process's working set
-    enable_privilege(L"SeLockMemoryPrivilege");           // and to lock pages in it
+    enable_privilege(L"SeLockMemoryPrivilege");          // and to lock pages in it
     HANDLE self = GetCurrentProcess();
     SIZE_T min_ws = 0, max_ws = 0;
     DWORD flags = 0;
@@ -106,10 +106,8 @@ LockResult lock_resident(void* p, uint64_t bytes, const LockProgress& progress) 
         const SIZE_T margin = (SIZE_T) 512 << 20;
         const SIZE_T new_min = min_ws + (SIZE_T) bytes + margin;
         const SIZE_T new_max = max_ws > new_min + margin ? max_ws : new_min + margin;
-        // The minimum is the hard limit and the maximum stays soft, so the process may still grow past it.
-        // MIN_DISABLE (which this call used to pass) fails the whole call with ERROR_INVALID_PARAMETER (87) at every
-        // size: the minimum is then never raised, the VirtualLock below fails with ERROR_WORKING_SET_QUOTA (1453)
-        // however much RAM is free, and the region's pages are trimmed straight back out.
+        // The minimum goes in as the hard limit: only a hard minimum keeps the locked pages from being trimmed back
+        // out. The maximum stays soft, so the process can still grow past it.
         if (!SetProcessWorkingSetSizeEx(self, new_min, new_max,
                                         QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE))
             quota_note = "SetProcessWorkingSetSizeEx(" + std::to_string((unsigned long long) (new_min >> 20)) +

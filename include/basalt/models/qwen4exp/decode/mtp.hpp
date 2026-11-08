@@ -6,7 +6,7 @@
 // the next draft step.
 //
 // Because a cell is a pair, this layer's cached K/V is keyed by bigrams, not by tokens: a conversation prefix of N
-// tokens names cells [0, N-1) (core::draft_cells).  Cell N-1's pair reaches the token at N, which the prefix does not
+// tokens names N-1 cells, [0, N-1).  Cell N-1's pair reaches the token at N, which the prefix does not
 // name, so a saved draft K/V never publishes it - the boundary cell belongs to the next slice.
 //
 //   e = fc_embedding(rms(embed(tok)) * (1+w))           h = fc_hidden per stream(rms_10240(R) * (1+w))

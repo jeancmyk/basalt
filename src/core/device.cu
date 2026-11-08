@@ -101,6 +101,8 @@ double device_h2d_gbps(int ordinal) {
     cudaGetLastError();
     cudaSetDevice(prev);
     return best;
+}
+
 const void* device_luid() {
     // The runtime's property struct carries the id on some platforms only, so it comes from the driver instead,
     // reached through the runtime's own entry-point lookup the way vmm.cpp reaches the driver.  A driver without
