@@ -97,6 +97,7 @@ add_library(model_qwen4exp_engine STATIC src/models/qwen4exp/decode/layer.cpp sr
   src/models/qwen4exp/decode/mtp/batching.cpp
   src/models/qwen4exp/conversation/conversation_snapshot.cpp
   src/models/qwen4exp/conversation/conversation_state.cpp
+  src/core/gdn_slots.cpp
  
  
   src/core/staged_copy.cpp)

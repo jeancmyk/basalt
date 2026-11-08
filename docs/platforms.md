@@ -19,9 +19,15 @@ through the platform file calls.
 
 ## Windows limitations
 
-- Pinned memory is capped under WDDM: the pinned slices are limited to `RAM/2 - 8 GiB` when the whole arena cannot be registered.
-- Large pages need "Lock pages in memory" (Administrators). Without it the engine uses 4 KiB pages and says so at start.
-- No shared arena files and no cgroup limits. `--ple-io direct` reads through the file cache.
+- Pinned memory is capped by the driver under WDDM. When the whole arena cannot be registered, the pinned slices are limited to the
+  GPU's shared-memory budget: the adapter's DXGI non-local budget less 8 GiB of headroom where DXGI answers, and `RAM/2 - 8 GiB` when
+  it does not. The start-up note says which one capped it and what was capped.
+- Large pages need the "Lock pages in memory" privilege, and locking the resident expert copy needs "Increase a process working set".
+  Grant both under Local Security Policy, User Rights Assignment. Without them the engine falls back to 4 KiB pages and says so at
+  start-up. A grant takes effect at the **next logon**: a token's privileges are snapshotted when its session is created, so a process
+  started from an existing session cannot acquire a right assigned afterwards, and the enable call reports
+  `ERROR_NOT_ALL_ASSIGNED` (1300). A 1300 in the start-up note means the grant has not taken effect yet, not that it was never made.
+- Shared arena files and cgroup quotas do not exist. The engine refuses the first and reports no container limit.
 - `basalt serve` runs the Python server as a child.
 - A display-attached GPU can hit the driver's timeout (TDR). Raise `TdrDelay` under `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`.
 - A card that drives the desktop has VRAM that moves between starts, so greedy output can differ run to run. Pin `expert-cache` and raise

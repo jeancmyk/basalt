@@ -119,11 +119,32 @@ def _contain(child: subprocess.Popen) -> bool:
         return False
 
 
+BREAKAWAY_FROM_JOB = 0x01000000   # CREATE_BREAKAWAY_FROM_JOB
+
+
+def _spawn(args, **kw) -> subprocess.Popen:
+    """Popen, with the child opted out of an enclosing job where that is permitted.
+
+    A job that does not grant breakaway does not ignore CREATE_BREAKAWAY_FROM_JOB: it fails the spawn with
+    ERROR_ACCESS_DENIED, which reads as a permissions problem on the binary. A supervisor that runs the server inside
+    its own job hits exactly that, so the flag is dropped and the child spawned again without it; it then stays in the
+    supervisor's job, which is the containment that supervisor was asking for.
+    """
+    try:
+        return subprocess.Popen(args, **kw)
+    except OSError as exc:
+        flags = kw.get("creationflags", 0)
+        if getattr(exc, "winerror", None) != 5 or not flags & BREAKAWAY_FROM_JOB:
+            raise
+        kw["creationflags"] = flags & ~BREAKAWAY_FROM_JOB
+        return subprocess.Popen(args, **kw)
+
+
 def popen(args, **kw) -> subprocess.Popen:
     """``subprocess.Popen(args, **kw)`` for a process that must not outlive the server."""
     if WINDOWS:
-        kw["creationflags"] = kw.get("creationflags", 0) | NEW_PROCESS_GROUP
-        child = subprocess.Popen(args, **kw)
+        kw["creationflags"] = kw.get("creationflags", 0) | NEW_PROCESS_GROUP | BREAKAWAY_FROM_JOB
+        child = _spawn(args, **kw)
         _contain(child)
         return child
     kw["preexec_fn"] = _child_setup(os.getpid(), kw.get("preexec_fn"))

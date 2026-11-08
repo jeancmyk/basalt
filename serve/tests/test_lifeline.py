@@ -40,9 +40,40 @@ class Flags(unittest.TestCase):
         with mock.patch.object(lifeline, "WINDOWS", True), mock.patch.object(lifeline, "_contain") as contain, \
                 mock.patch.object(subprocess, "Popen") as popen:
             lifeline.popen(["x"], creationflags=0x8)
-        self.assertEqual(popen.call_args.kwargs["creationflags"], 0x8 | lifeline.NEW_PROCESS_GROUP)
+        self.assertEqual(popen.call_args.kwargs["creationflags"],
+                         0x8 | lifeline.NEW_PROCESS_GROUP | lifeline.BREAKAWAY_FROM_JOB)
         self.assertNotIn("preexec_fn", popen.call_args.kwargs)
         contain.assert_called_once_with(popen.return_value)
+
+    def test_a_job_without_breakaway_gets_one_more_spawn_without_the_flag(self):
+        """A supervisor's job fails CREATE_BREAKAWAY_FROM_JOB with ACCESS_DENIED; the second spawn drops it."""
+        denied = OSError(5, "Access is denied")
+        denied.winerror = 5
+        calls = []
+
+        def fake(args, **kw):
+            calls.append(dict(kw))
+            if len(calls) == 1:
+                raise denied
+            return mock.Mock()
+
+        with mock.patch.object(lifeline, "WINDOWS", True), mock.patch.object(lifeline, "_contain"), \
+                mock.patch.object(subprocess, "Popen", fake):
+            lifeline.popen(["x"])
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[0]["creationflags"] & lifeline.BREAKAWAY_FROM_JOB)
+        self.assertEqual(calls[1]["creationflags"],
+                         lifeline.NEW_PROCESS_GROUP)
+        self.assertTrue(calls[1]["creationflags"] & lifeline.NEW_PROCESS_GROUP)
+
+    def test_any_other_spawn_failure_propagates(self):
+        missing = OSError(2, "No such file")
+        missing.winerror = 2
+        with mock.patch.object(lifeline, "WINDOWS", True), mock.patch.object(lifeline, "_contain"), \
+                mock.patch.object(subprocess, "Popen", side_effect=missing) as popen:
+            with self.assertRaises(OSError):
+                lifeline.popen(["x"])
+        popen.assert_called_once()       # no retry for anything but the breakaway refusal
 
     def test_posix_starts_from_the_anchor_thread_with_a_child_setup(self):
         seen = {}
@@ -59,6 +90,7 @@ class Flags(unittest.TestCase):
         self.assertNotIn("creationflags", seen["kw"])
         self.assertTrue(callable(seen["kw"]["preexec_fn"]))
 
+    @unittest.skipUnless(hasattr(os, "setpgid"), "needs POSIX process groups")
     def test_the_child_setup_makes_a_group_sets_the_death_signal_and_chains(self):
         calls = []
         then = mock.Mock()
@@ -70,6 +102,7 @@ class Flags(unittest.TestCase):
                                  ("prctl", (lifeline.PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0))])
         then.assert_called_once_with()
 
+    @unittest.skipUnless(hasattr(os, "setpgid"), "needs POSIX process groups")
     def test_a_parent_that_already_died_kills_the_child(self):
         with mock.patch.object(os, "setpgid"), mock.patch.object(lifeline, "_prctl"), \
                 mock.patch.object(os, "getppid", return_value=1), mock.patch.object(os, "kill") as kill:

@@ -1,6 +1,8 @@
 // src/platform/memory.cpp - see include/basalt/platform/memory.hpp.
 #include "basalt/platform/memory.hpp"
 
+#include "basalt/platform/file.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -10,9 +12,12 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
-#include <malloc.h>   // _aligned_malloc, _aligned_free, _heapmin
+#include <malloc.h>   // _aligned_malloc, _aligned_free
+#include <dxgi1_4.h>  // IDXGIAdapter3::QueryVideoMemoryInfo
+#include <psapi.h>    // QueryWorkingSetEx: the large-page flag of a mapping's own pages
 #else
 #include <fcntl.h>
 #include <malloc.h>   // malloc_trim
@@ -30,17 +35,54 @@ namespace basalt::platform {
 #if defined(_WIN32)
 namespace {
 /// Enables one privilege in this process's token. A privilege can be assigned to the account and still be absent
-/// from the token until the process asks for it, which is the normal state for an interactive one.
-void enable_privilege(LPCWSTR name) {
+/// from the token until the process asks for it, which is the normal state for an interactive one. False when the
+/// token could not be adjusted.
+///
+/// The error is cleared BEFORE the call: AdjustTokenPrivileges sets it only for ERROR_NOT_ALL_ASSIGNED, so on full
+/// success the previous value stands and a stale error would make a working privilege look refused.
+bool enable_privilege(LPCWSTR name) {
     HANDLE tok = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) return;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) return false;
+    bool ok = false;
     TOKEN_PRIVILEGES tp{};
     tp.PrivilegeCount = 1;
     if (LookupPrivilegeValueW(nullptr, name, &tp.Privileges[0].Luid)) {
         tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        (void) AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr);
+        SetLastError(ERROR_SUCCESS);
+        if (AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) != 0)
+            ok = GetLastError() == ERROR_SUCCESS;   // ERROR_NOT_ALL_ASSIGNED when the account has no such right
     }
     CloseHandle(tok);
+    return ok;
+}
+
+/// What a committed range's own pages say about it.  A page reports its backing only once it is resident, so this
+/// writes a zero byte at a bounded number of addresses spread over the range - the range is committed zeroed, so the
+/// write cannot change it - and reads the flags back.  `sampled` counts the addresses the query answered for (0 when
+/// it could not run, which is unknown rather than a refusal) and `large` those it flagged as large pages.
+struct PageBacking {
+    uint64_t sampled = 0, large = 0;
+};
+PageBacking page_backing(void* p, uint64_t bytes, size_t samples = 16) {
+    PageBacking r;
+    constexpr uint64_t kPage = 4096;
+    if (p == nullptr || bytes < kPage || samples == 0) return r;
+    uint64_t stride = bytes / samples;
+    stride = (stride + kPage - 1) / kPage * kPage;
+    if (stride == 0) stride = kPage;
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info;
+    for (uint64_t off = 0; off < bytes; off += stride) {
+        uint8_t* const at = static_cast<uint8_t*>(p) + off;
+        *at = 0;   // fault the page in, then ask the OS what backs it
+        info.push_back(PSAPI_WORKING_SET_EX_INFORMATION{at});
+    }
+    if (!QueryWorkingSetEx(GetCurrentProcess(), info.data(), (DWORD) (info.size() * sizeof info[0]))) return r;
+    for (const PSAPI_WORKING_SET_EX_INFORMATION& e : info) {
+        if (!e.VirtualAttributes.Valid) continue;
+        ++r.sampled;
+        if (e.VirtualAttributes.LargePage) ++r.large;
+    }
+    return r;
 }
 }  // namespace
 #endif
@@ -50,7 +92,7 @@ LockResult lock_resident(void* p, uint64_t bytes, const LockProgress& progress) 
     if (p == nullptr || bytes == 0) { r.note = "nothing to lock"; return r; }
 #if defined(_WIN32)
     enable_privilege(L"SeIncreaseWorkingSetPrivilege");   // to raise this process's working set
-    enable_privilege(L"SeLockMemoryPrivilege");          // and to lock pages in it
+    enable_privilege(L"SeLockMemoryPrivilege");           // and to lock pages in it
     HANDLE self = GetCurrentProcess();
     SIZE_T min_ws = 0, max_ws = 0;
     DWORD flags = 0;
@@ -64,8 +106,10 @@ LockResult lock_resident(void* p, uint64_t bytes, const LockProgress& progress) 
         const SIZE_T margin = (SIZE_T) 512 << 20;
         const SIZE_T new_min = min_ws + (SIZE_T) bytes + margin;
         const SIZE_T new_max = max_ws > new_min + margin ? max_ws : new_min + margin;
-        // The minimum goes in as the hard limit: only a hard minimum keeps the locked pages from being trimmed back
-        // out. The maximum stays soft, so the process can still grow past it.
+        // The minimum is the hard limit and the maximum stays soft, so the process may still grow past it.
+        // MIN_DISABLE (which this call used to pass) fails the whole call with ERROR_INVALID_PARAMETER (87) at every
+        // size: the minimum is then never raised, the VirtualLock below fails with ERROR_WORKING_SET_QUOTA (1453)
+        // however much RAM is free, and the region's pages are trimmed straight back out.
         if (!SetProcessWorkingSetSizeEx(self, new_min, new_max,
                                         QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE))
             quota_note = "SetProcessWorkingSetSizeEx(" + std::to_string((unsigned long long) (new_min >> 20)) +
@@ -180,6 +224,33 @@ std::atomic<uint64_t> g_ram_reserve{kDefaultRamReserveBytes};
 uint64_t ram_reserve() { return g_ram_reserve.load(); }
 
 void set_ram_reserve(uint64_t bytes) { g_ram_reserve = bytes; }
+
+uint64_t commit_limit() {
+#if defined(_WIN32)
+    // RAM plus the page file: the pair a page-locked or fully reserved arena has to fit inside.
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullTotalPageFile : 0;
+#else
+    return total_physical_memory();
+#endif
+}
+
+bool working_set_quota(uint64_t& min_bytes, uint64_t& max_bytes) {
+#if defined(_WIN32)
+    SIZE_T min_ws = 0, max_ws = 0;
+    DWORD flags = 0;
+    if (!GetProcessWorkingSetSizeEx(GetCurrentProcess(), &min_ws, &max_ws, &flags)) return false;
+    min_bytes = (uint64_t) min_ws;
+    max_bytes = (uint64_t) max_ws;
+    return true;
+#else
+    // Linux sets no per-process working-set quota; the page-lock limit itself is what binds.
+    (void) min_bytes;
+    (void) max_bytes;
+    return false;
+#endif
+}
 
 uint64_t ram_budget(bool* known) {
     const uint64_t avail = available_memory();
@@ -604,24 +675,44 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
     }
     // MEM_LARGE_PAGES needs SeLockMemoryPrivilege, and the account having it assigned is not enough: the process
     // enables it in its own token first. An account without the assignment fails here and falls through to the
-    // ordinary allocation below, which is the expected outcome rather than an error.
-    enable_privilege(L"SeLockMemoryPrivilege");
+    // ordinary allocation below, which is the expected outcome rather than an error. The large-page probe enables it
+    // through the same call, so the two cannot drift apart.
+    (void) enable_lock_memory_privilege();
     const SIZE_T large = GetLargePageMinimum();
     if (large > 0) {
         // The requested size must be an exact multiple of the large-page minimum; the slack is under one page.
-        const SIZE_T lbytes = (SIZE_T) (((SIZE_T) bytes + large - 1) / large * large);
-        void* p = VirtualAlloc(nullptr, lbytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
-        if (p != nullptr) {
-            got = RegionBacking::LargePages;
-            note = "large pages (" + std::to_string((unsigned long long) large) + " B)";
-            return p;
+        const uint64_t lp_bytes = ((uint64_t) bytes + (uint64_t) large - 1) / (uint64_t) large * (uint64_t) large;
+        // ONE CALL, RESERVATION AND COMMIT TOGETHER.  MEM_LARGE_PAGES is honoured only when the reservation and the
+        // commit are the same call: committing a subrange of an existing reservation with the flag is ACCEPTED and
+        // hands back 4 KB pages, which is why the reserve-then-chunked-commit shape this used to have reported a
+        // large-page arena that never was one.  Whether a smaller pool would have fitted is a separate question, and
+        // the large-page probe answers it.
+        if (void* p = VirtualAlloc(nullptr, (SIZE_T) lp_bytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                                   PAGE_READWRITE)) {
+            // Read the backing off the mapping rather than trust the flag: an accepted call that gave small pages is
+            // the failure mode above, and it must not be reported as large pages.  A query that answered nothing is
+            // unknown rather than a refusal, so the accepted form stands in that case.
+            const PageBacking g = page_backing(p, lp_bytes);
+            if (g.sampled == 0 || g.large > 0) {
+                got = RegionBacking::LargePages;
+                note = "large pages (" + std::to_string((unsigned long long) large) + " B), one reserve-and-commit of " +
+                       std::to_string(lp_bytes >> 20) + " MiB, " +
+                       (g.sampled > 0 ? std::to_string(g.large) + " of " + std::to_string(g.sampled) +
+                                         " sampled addresses flagged large"
+                                      : "the working-set query read no address back");
+                return p;
+            }
+            VirtualFree(p, 0, MEM_RELEASE);
+            note = "large pages accepted but not given (" + std::to_string(g.sampled) +
+                   " addresses read back from the mapping, none flagged large); using 4 KB pages";
+        } else {
+            // ERROR_NO_SYSTEM_RESOURCES is the page pool declining, ERROR_PRIVILEGE_NOT_HELD is the token and
+            // ERROR_INVALID_PARAMETER a size that is not a multiple of the minimum. They need different fixes, so the
+            // note carries the number; the probe's granted figure says whether the pool is merely smaller than this.
+            note = "large pages refused for " + gib_size(lp_bytes) + " (GetLargePageMinimum=" +
+                   std::to_string((unsigned long long) large) + " B, VirtualAlloc error " +
+                   std::to_string((unsigned long long) GetLastError()) + "); the probe says what the pool would grant";
         }
-        // ERROR_NO_SYSTEM_RESOURCES is the page pool declining, ERROR_PRIVILEGE_NOT_HELD is the token and
-        // ERROR_INVALID_PARAMETER a size that is not a multiple of the minimum. They need different fixes, so the
-        // note carries the number.
-        note = "large pages refused for " + std::to_string((unsigned long long) lbytes) +
-               " B (GetLargePageMinimum=" + std::to_string((unsigned long long) large) + ", VirtualAlloc error " +
-               std::to_string((unsigned long long) GetLastError()) + "); using 4 KB pages";
     } else {
         note = "this system has no large-page minimum; using 4 KB pages";
     }
@@ -663,13 +754,32 @@ void free_region(void* p, uint64_t bytes) {
     VirtualFree(p, 0, MEM_RELEASE);
 }
 
-bool pin_budget(uint64_t& limit, std::string& why) {
+bool pin_budget(uint64_t& limit, std::string& why, const void* luid) {
     constexpr uint64_t GiB = 1ull << 30;
+    // Page-locked memory the GPU maps is charged to the device's shared (non-local) segment. Registering slice by
+    // slice until the driver refuses leaves that segment full and every later device allocation fails "out of
+    // memory", so the caller stops at the segment's budget instead, keeping room for what it allocates after.
+    constexpr uint64_t kHeadroom = 8ull * GiB;
+    char buf[192];
+    const uint64_t budget = dxgi_non_local_budget(luid);
+    if (budget != 0) {
+        if (budget > kHeadroom) {
+            limit = budget - kHeadroom;
+            std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget, %.1f GiB via DXGI (minus %.0f GiB headroom)",
+                          (double) budget / (double) GiB, (double) kHeadroom / (double) GiB);
+        } else {
+            limit = budget;
+            std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget, %.1f GiB via DXGI (no headroom taken)",
+                          (double) budget / (double) GiB);
+        }
+        why = buf;
+        return true;
+    }
+    // DXGI did not answer. The shared segment is about half of installed RAM, so the RAM reading bounds it.
     const uint64_t ram = basalt::platform::total_physical_memory();
     if (ram == 0) return false;
     limit = ram / 2 > 8 * GiB ? ram / 2 - 8 * GiB : 0;
-    char buf[192];
-    std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget, RAM/2 - 8 GiB of %.1f GiB RAM",
+    std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget, RAM/2 - 8 GiB of %.1f GiB RAM (DXGI unavailable)",
                   (double) ram / (double) GiB);
     why = buf;
     return true;
@@ -788,25 +898,66 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
     }
 
     {
-        void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
-        if (p != MAP_FAILED) {
-            got = RegionBacking::LargePages;
-            note = "hugetlb 2 MB pages";
-            return p;
+        // CHUNKED, NOT ALL-OR-NOTHING.  One mmap(MAP_HUGETLB) over the whole arena fails exactly like an absent
+        // pool when the pool is merely smaller than the arena, and it cannot say how far a partial pool would have
+        // got.  The arena has to stay ONE contiguous range (layer bounds index into it, the registration covers it
+        // whole, the destructor unmaps it in one call), so the range is reserved first and then filled piece by
+        // piece with MAP_FIXED into that reservation.  The chunk matches the Windows commit chunk: tens of syscalls
+        // for an arena of this size, and a multiple of the 2 MiB page.
+        // Linux needs two details Windows does not: the reservation is PROT_NONE and the pieces are MAP_FIXED over
+        // it, and the base is aligned up to 2 MiB by hand with a page of padding, because the kernel only picks a
+        // huge-page-aligned address itself when addr is NULL.  Without that alignment MAP_FIXED fails EINVAL on a
+        // misaligned base and the run would look like a pool refusal.
+        constexpr uint64_t kChunk = 1ull << 30;
+        const uint64_t page = 1ull << 21;
+        const uint64_t huge_bytes = (bytes + page - 1) / page * page;
+        const uint64_t padded = huge_bytes + page;
+        void* raw = mmap(nullptr, (size_t) padded, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (raw != MAP_FAILED) {
+            void* reserved = (void*) (((uintptr_t) raw + page - 1) & ~(uintptr_t) (page - 1));
+            uint64_t off = 0, granted = 0;
+            int first_errno = 0;
+            for (; off < huge_bytes; off += kChunk) {
+                const uint64_t n = huge_bytes - off < kChunk ? huge_bytes - off : kChunk;
+                void* piece = mmap((uint8_t*) reserved + off, (size_t) n, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB | MAP_FIXED, -1, 0);
+                if (piece == MAP_FAILED) {
+                    first_errno = errno;
+                    break;
+                }
+                granted = off + n;
+            }
+            if (off >= huge_bytes) {
+                got = RegionBacking::LargePages;
+                note = "hugetlb 2 MB pages, " + std::to_string((huge_bytes + kChunk - 1) / kChunk) +
+                       " chunks of up to " + std::to_string(kChunk >> 20) + " MiB";
+                // the whole padded reservation, so the one unmap releases the slack too
+                mapping_base = raw;
+                mapping_bytes = padded;
+                return reserved;
+            }
+            // ALL OR NOTHING, as on Windows: a half-converted arena would need a third backing state, so the whole
+            // reservation goes back.  One unmap of the raw span covers the fixed pieces and the untouched
+            // reservation alike, because the MAP_FIXED calls replaced subranges of it.
+            munmap(raw, (size_t) padded);
+            // Name the shortfall, and now also where the loop stopped: a pool that covers part of the arena and one
+            // that will not grant a single page are different failures.
+            const unsigned long long need = (unsigned long long) (huge_bytes / page);
+            unsigned long long pool = 0;
+            bool have_pool = false;
+            if (std::FILE* f = std::fopen("/proc/sys/vm/nr_hugepages", "r")) {
+                have_pool = std::fscanf(f, "%llu", &pool) == 1;
+                std::fclose(f);
+            }
+            note = "MAP_HUGETLB refused at " + std::to_string(off >> 20) + " MiB of " +
+                   std::to_string(huge_bytes >> 20) + " MiB (granted " + std::to_string(granted >> 20) +
+                   " MiB in " + std::to_string((off + kChunk - 1) / kChunk) + " chunks, errno " +
+                   std::to_string(first_errno) + "; needed " + std::to_string(need) + " 2 MiB pages, vm.nr_hugepages=" +
+                   (have_pool ? std::to_string(pool) : std::string("?")) + "); using 4 KB pages";
+        } else {
+            note = "MAP_HUGETLB: cannot reserve " + std::to_string(huge_bytes >> 20) + " MiB (errno " +
+                   std::to_string(errno) + "); using 4 KB pages";
         }
-        // MAP_HUGETLB is all-or-nothing: a pool smaller than the mapping fails exactly like an absent
-        // one, and the old message guessed "no hugetlb pool configured" either way. Name the shortfall:
-        // how many 2 MiB pages the mapping needs against what vm.nr_hugepages actually holds.
-        const unsigned long long need = ((unsigned long long) bytes + (1ull << 21) - 1) / (1ull << 21);
-        unsigned long long pool = 0;
-        bool have_pool = false;
-        if (std::FILE* f = std::fopen("/proc/sys/vm/nr_hugepages", "r")) {
-            have_pool = std::fscanf(f, "%llu", &pool) == 1;
-            std::fclose(f);
-        }
-        note = "MAP_HUGETLB unavailable (needed " + std::to_string(need) + " 2 MiB pages, vm.nr_hugepages=" +
-               (have_pool ? std::to_string(pool) : std::string("?")) + "); using 4 KB pages";
     }
     // No hugetlb mapping: a 2 MiB-aligned anonymous mapping with MADV_HUGEPAGE, so transparent huge pages back
     // it where THP is "madvise" (the common distro default). The CPU expert pool streams whole experts out of
@@ -836,8 +987,33 @@ void free_region(void* p, uint64_t bytes) {
     munmap(p, bytes);
 }
 
-bool pin_budget(uint64_t&, std::string&) { return false; }   // no OS-side budget below the driver's own limit
+bool pin_budget(uint64_t&, std::string&, const void*) { return false; }   // no OS-side budget below the driver's own limit
 #endif
+
+void region_page_backing(void* p, uint64_t bytes, uint64_t& sampled, uint64_t& large) {
+    sampled = 0;
+    large = 0;
+#if defined(_WIN32)
+    const PageBacking g = page_backing(p, bytes);
+    sampled = g.sampled;
+    large = g.large;
+#else
+    if (p == nullptr || bytes < 4096) return;
+    static_cast<uint8_t*>(p)[0] = 0;   // fault the first page, so the kernel describes the mapping at all
+    if (std::FILE* f = std::fopen("/proc/self/smaps", "r")) {
+        char line[512];
+        const unsigned long long addr = (unsigned long long) (uintptr_t) p;
+        unsigned long long lo = 0, hi = 0, page_kb = 0;
+        while (std::fgets(line, sizeof line, f)) {
+            unsigned long long s = 0, e = 0;
+            if (std::sscanf(line, "%llx-%llx", &s, &e) == 2) { lo = s; hi = e; page_kb = 0; continue; }
+            if (addr >= lo && addr < hi && std::sscanf(line, "PageSize: %llu kB", &page_kb) == 1) break;
+        }
+        std::fclose(f);
+        if (hi > lo) { sampled = 1; if (page_kb * 1024ull > 4096) large = 1; }
+    }
+#endif
+}
 
 void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
                    uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
@@ -849,5 +1025,353 @@ void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const 
     return p;
 }
 
+
+DxgiMemory dxgi_memory(const void* luid) {
+    DxgiMemory out;
+#if defined(_WIN32)
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**) &factory)) || !factory) return out;
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; ++i) {
+        if (adapter == nullptr) break;
+        bool match = luid == nullptr;
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(adapter->GetDesc1(&desc)) && luid != nullptr) {
+            const LUID* pluid = (const LUID*) luid;
+            match = desc.AdapterLuid.LowPart == pluid->LowPart && desc.AdapterLuid.HighPart == pluid->HighPart;
+        }
+        if (!match) {
+            adapter->Release();
+            adapter = nullptr;
+            continue;
+        }
+        IDXGIAdapter3* a3 = nullptr;
+        if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**) &a3)) && a3 != nullptr) {
+            DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
+            if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local))) {
+                out.local_budget = (uint64_t) local.Budget;
+                out.local_usage = (uint64_t) local.CurrentUsage;
+                out.ok = true;
+            }
+            if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared))) {
+                out.non_local_budget = (uint64_t) shared.Budget;
+                out.non_local_usage = (uint64_t) shared.CurrentUsage;
+            }
+            a3->Release();
+        }
+        // A failed enumeration is "unknown", not "none": a service or an OpenSSH session cannot enumerate outputs,
+        // and a zero there would let the caller plan the whole budget on a machine that is driving a display.
+        IDXGIOutput* output = nullptr;
+        HRESULT hr = S_OK;
+        int n = 0;
+        while ((hr = adapter->EnumOutputs((UINT) n, &output)) == S_OK) {
+            if (output != nullptr) output->Release();
+            ++n;
+        }
+        out.outputs = hr == DXGI_ERROR_NOT_FOUND ? n : -1;
+        adapter->Release();
+        break;
+    }
+    factory->Release();
+#else
+    (void) luid;
+#endif
+    return out;
+}
+
+DxgiMemory print_dxgi_memory_report(const void* luid, bool luid_matched) {
+    const DxgiMemory m = dxgi_memory(luid);
+#if defined(_WIN32)
+    if (!m.ok) {
+        std::fprintf(stderr, "  dxgi: no adapter reports a video-memory budget\n");
+        return m;
+    }
+    // Say which adapter the figures came from: matching the device the caller named is the honest case, and taking
+    // the first adapter is a guess the reader is entitled to know about.
+    std::fprintf(stderr, "  dxgi adapter: %s\n",
+                 luid_matched ? "matched to the device named" : "the first adapter: no device was named");
+    std::fprintf(stderr, "  dxgi local (device memory): budget %llu MiB, usage %llu MiB, headroom %llu MiB\n",
+                 (unsigned long long) (m.local_budget >> 20), (unsigned long long) (m.local_usage >> 20),
+                 (unsigned long long) ((m.local_budget > m.local_usage ? m.local_budget - m.local_usage : 0) >> 20));
+    std::fprintf(stderr, "  dxgi non-local (shared memory): budget %llu MiB, usage %llu MiB, headroom %llu MiB\n",
+                 (unsigned long long) (m.non_local_budget >> 20), (unsigned long long) (m.non_local_usage >> 20),
+                 (unsigned long long) ((m.non_local_budget > m.non_local_usage ? m.non_local_budget - m.non_local_usage : 0) >> 20));
+    if (m.outputs < 0) std::fprintf(stderr, "  dxgi outputs: unknown (the enumeration failed)\n");
+    else std::fprintf(stderr, "  dxgi outputs: %d\n", m.outputs);
+#else
+    (void) luid;
+    (void) luid_matched;   // nothing budgets video memory here, and the figures say so
+#endif
+    return m;
+}
+
+bool budgets_video_memory() {
+#if defined(_WIN32)
+    return true;
+#else
+    return false;
+#endif
+}
+
+uint64_t dxgi_non_local_budget(const void* luid) { return dxgi_memory(luid).non_local_budget; }
+
+bool enable_lock_memory_privilege() {
+#if defined(_WIN32)
+    return enable_privilege(L"SeLockMemoryPrivilege");
+#else
+    return false;
+#endif
+}
+
+LargePagePrivilege probe_large_page_privilege() {
+    LargePagePrivilege p;
+#if defined(_WIN32)
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &tok)) {
+        p.note = "OpenProcessToken failed (error " + std::to_string(GetLastError()) + ")";
+        return p;
+    }
+    // 1. Is SeLockMemoryPrivilege in the token at all, and is it enabled? This is the pair a 1314 has to be read
+    //    against: a privilege that is absent cannot be enabled by AdjustTokenPrivileges, and one that is present but
+    //    refused by the allocation is a different problem from one the account never had.
+    LUID luid{};
+    if (LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &luid)) {
+        p.looked_up = true;
+        DWORD need = 0;
+        (void) GetTokenInformation(tok, TokenPrivileges, nullptr, 0, &need);
+        if (need > 0) {
+            std::vector<uint8_t> buf(need);
+            if (GetTokenInformation(tok, TokenPrivileges, buf.data(), need, &need)) {
+                const TOKEN_PRIVILEGES* tp = (const TOKEN_PRIVILEGES*) buf.data();
+                for (DWORD i = 0; i < tp->PrivilegeCount; ++i) {
+                    if (tp->Privileges[i].Luid.LowPart == luid.LowPart &&
+                        tp->Privileges[i].Luid.HighPart == luid.HighPart) {
+                        p.present = true;
+                        p.enabled = (tp->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED) != 0;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // 2. Elevation and integrity: a UAC-filtered token at Medium integrity is the ordinary interactive case, and a
+    //    privilege that is present there can still be refused by the allocation.
+    {
+        TOKEN_ELEVATION el{};
+        DWORD n = 0;
+        if (GetTokenInformation(tok, TokenElevation, &el, sizeof el, &n)) p.elevated = el.TokenIsElevated != 0;
+    }
+    {
+        DWORD need = 0;
+        (void) GetTokenInformation(tok, TokenIntegrityLevel, nullptr, 0, &need);
+        if (need > 0) {
+            std::vector<uint8_t> buf(need);
+            if (GetTokenInformation(tok, TokenIntegrityLevel, buf.data(), need, &need)) {
+                const TOKEN_MANDATORY_LABEL* ml = (const TOKEN_MANDATORY_LABEL*) buf.data();
+                const DWORD* rid = (const DWORD*) GetSidSubAuthority(
+                    ml->Label.Sid, (DWORD) (GetSidSubAuthorityCount(ml->Label.Sid)[0] - 1));
+                if (rid != nullptr) p.integrity_rid = *rid;   // 0x1000 medium, 0x2000 high, 0x3000 system
+            }
+        }
+    }
+    // 3. Is Administrators present but deny-only? That is what a filtered token looks like, and it is the reason a
+    //    privilege can be listed and enabled while the allocation still refuses it.
+    {
+        DWORD need = 0;
+        (void) GetTokenInformation(tok, TokenGroups, nullptr, 0, &need);
+        if (need > 0) {
+            std::vector<uint8_t> buf(need);
+            if (GetTokenInformation(tok, TokenGroups, buf.data(), need, &need)) {
+                const TOKEN_GROUPS* tg = (const TOKEN_GROUPS*) buf.data();
+                PSID admins_sid = nullptr;
+                SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+                if (AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0,
+                                             0, 0, &admins_sid)) {
+                    for (DWORD i = 0; i < tg->GroupCount; ++i) {
+                        if (!EqualSid(tg->Groups[i].Sid, admins_sid)) continue;
+                        p.admin_group = true;
+                        p.admin_deny_only = (tg->Groups[i].Attributes & SE_GROUP_USE_FOR_DENY_ONLY) != 0;
+                        break;
+                    }
+                    FreeSid(admins_sid);
+                }
+            }
+        }
+    }
+    CloseHandle(tok);
+    // 4. The two allocation forms, each with its own error: the documented single call, and reserve-then-commit.
+    {
+        const SIZE_T two_mib = (SIZE_T) GetLargePageMinimum();
+        void* a = VirtualAlloc(nullptr, two_mib, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+        p.single_ok = a != nullptr;
+        p.single_error = a != nullptr ? 0 : (uint64_t) GetLastError();
+        if (a != nullptr) VirtualFree(a, 0, MEM_RELEASE);
+    }
+    {
+        const SIZE_T two_mib = (SIZE_T) GetLargePageMinimum();
+        void* b = VirtualAlloc(nullptr, two_mib, MEM_RESERVE, PAGE_READWRITE);
+        p.reserve_ok = b != nullptr;
+        p.reserve_error = b != nullptr ? 0 : (uint64_t) GetLastError();
+        if (b != nullptr) {
+            void* c = VirtualAlloc(b, two_mib, MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+            p.commit_ok = c != nullptr;
+            p.commit_error = c != nullptr ? 0 : (uint64_t) GetLastError();
+            if (c != nullptr) {   // the form the arena commits with: read its pages back before releasing them
+                const PageBacking g = page_backing(c, (uint64_t) two_mib);
+                p.commit_sampled = g.sampled;
+                p.commit_large = g.large;
+            }
+            VirtualFree(b, 0, MEM_RELEASE);
+        }
+    }
+    p.ok = true;
+#else
+    p.note = "not applicable on this platform";
+#endif
+    return p;
+}
+
+LargePageProbe probe_large_pages(uint64_t want) {
+    LargePageProbe p;
+#if defined(_WIN32)
+    p.minimum = (uint64_t) GetLargePageMinimum();
+    p.requested = want;
+    if (p.minimum == 0) return p;
+    enable_lock_memory_privilege();   // the pool needs the privilege in this token, whatever the arena did
+    const uint64_t floor = p.minimum * 32;   // the smallest block worth reporting
+    for (uint64_t ask = want / p.minimum * p.minimum; ask >= floor; ask = ask / 2 / p.minimum * p.minimum) {
+        void* got = VirtualAlloc(nullptr, (SIZE_T) ask, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+        if (got != nullptr) {
+            const PageBacking b = page_backing(got, ask);   // while it is still mapped
+            p.sampled = b.sampled;
+            p.large_pages = b.large;
+            VirtualFree(got, 0, MEM_RELEASE);
+            p.granted = ask;
+            return p;
+        }
+        if (p.error == 0) p.error = (uint64_t) GetLastError();
+    }
+#else
+    (void) want;
+#endif
+    return p;
+}
+
+double ViewFaultProbe::off_ms_per_mib() const {
+    return window_bytes > 0 && off_seconds > 0 ? off_seconds * 1000.0 / ((double) window_bytes / 1048576.0) : 0.0;
+}
+double ViewFaultProbe::on_ms_per_mib() const {
+    return window_bytes > 0 && on_seconds > 0 ? on_seconds * 1000.0 / ((double) window_bytes / 1048576.0) : 0.0;
+}
+double ViewFaultProbe::early_ms_per_mib() const {
+    return window_bytes > 0 && early_seconds > 0 ? early_seconds * 1000.0 / ((double) window_bytes / 1048576.0) : 0.0;
+}
+
+namespace {
+#if defined(_WIN32)
+bool map_readonly(const std::string& path, void*& view, uint64_t& size) {
+    HANDLE fh = CreateFileW(to_wide(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (fh == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    const bool sized = GetFileSizeEx(fh, &sz) != 0;
+    if (sized) size = (uint64_t) sz.QuadPart;
+    HANDLE map = sized ? CreateFileMappingW(fh, nullptr, PAGE_READONLY, 0, 0, nullptr) : nullptr;
+    CloseHandle(fh);
+    if (map == nullptr) return false;
+    view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(map);
+    return view != nullptr;
+}
+void unmap_readonly(void* view, uint64_t) {
+    if (view != nullptr) UnmapViewOfFile(view);
+}
+#else
+bool map_readonly(const std::string& path, void*& view, uint64_t& size) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st{};
+    const bool sized = fstat(fd, &st) == 0 && st.st_size > 0;
+    if (sized) size = (uint64_t) st.st_size;
+    void* v = sized ? mmap(nullptr, (size_t) size, PROT_READ, MAP_PRIVATE, fd, 0) : MAP_FAILED;
+    ::close(fd);
+    if (v == MAP_FAILED) return false;
+    view = v;
+    return true;
+}
+void unmap_readonly(void* view, uint64_t size) {
+    if (view != nullptr) munmap(view, (size_t) size);
+}
+#endif
+
+/// Touch one byte of every page of [view, view + bytes): the cost measured is the fault, not the copy. `hint` issues
+/// the prefetch inside the timed region, because its cost is part of the answer; `wait_first` instead hints, waits
+/// `wait_ms` outside the clock, and then times the touch alone.
+double fault_window(const uint8_t* view, uint64_t bytes, int mode, uint32_t wait_ms) {
+    using clock = std::chrono::steady_clock;
+    if (mode == 2) {
+        advise_willneed(view, bytes);
+        if (wait_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+    }
+    const auto t0 = clock::now();
+    if (mode == 1) advise_willneed(view, bytes);
+    volatile uint8_t sink = 0;
+    for (uint64_t off = 0; off < bytes; off += 4096) sink = (uint8_t) (sink + view[off]);
+    const auto t1 = clock::now();
+    (void) sink;
+    return std::chrono::duration<double>(t1 - t0).count();
+}
+}  // namespace
+
+ViewFaultProbe probe_view_faults(const std::string& path, uint64_t window_bytes, uint32_t rounds, uint32_t wait_ms) {
+    ViewFaultProbe p;
+    p.window_bytes = window_bytes;
+    p.wait_ms = (double) wait_ms;
+    if (window_bytes < 4096 || rounds == 0) {
+        p.error = "probe: a window of at least one page and one round are needed";
+        return p;
+    }
+    constexpr uint32_t kArms = 3;
+    const uint32_t windows = rounds * kArms;
+    void* v = nullptr;
+    uint64_t size = 0;
+    if (!map_readonly(path, v, size)) { p.error = "probe: cannot map " + path; return p; }
+    unmap_readonly(v, size);
+    // one gap before the first window and one after the last, so no window is clipped
+    const uint64_t stride = size / (uint64_t) (windows + 1);
+    if (stride < window_bytes) { p.error = "probe: the file is too small for that many windows"; return p; }
+    double sum[kArms] = {0, 0, 0}, lo[kArms] = {0, 0, 0}, hi[kArms] = {0, 0, 0};
+    uint32_t n[kArms] = {0, 0, 0};
+    for (uint32_t r = 0; r < rounds; ++r) {
+        for (uint32_t k = 0; k < kArms; ++k) {
+            const uint32_t idx = r * kArms + k;
+            const uint64_t off = (uint64_t) (idx + 1) * stride;
+            // rotate which arm gets which of the round's windows, so no arm is always the colder one
+            const uint32_t mode = (k + r) % kArms;
+            void* view = nullptr;
+            uint64_t msize = 0;
+            if (!map_readonly(path, view, msize)) { p.error = "probe: cannot map " + path; return p; }
+            const double s = fault_window((const uint8_t*) view + off, window_bytes, (int) mode, wait_ms);
+            unmap_readonly(view, msize);
+            if (n[mode] == 0 || s < lo[mode]) lo[mode] = s;
+            if (n[mode] == 0 || s > hi[mode]) hi[mode] = s;
+            sum[mode] += s;
+            ++n[mode];
+        }
+    }
+    for (uint32_t a = 0; a < kArms; ++a)
+        if (n[a] == 0) { p.error = "probe: an arm did not run"; return p; }
+    p.off_seconds = sum[0] / (double) n[0];
+    p.off_min = lo[0];
+    p.off_max = hi[0];
+    p.on_seconds = sum[1] / (double) n[1];
+    p.on_min = lo[1];
+    p.on_max = hi[1];
+    p.early_seconds = sum[2] / (double) n[2];
+    p.early_min = lo[2];
+    p.early_max = hi[2];
+    p.windows_per_arm = n[0];
+    p.ok = true;
+    return p;
+}
 
 }  // namespace basalt::platform

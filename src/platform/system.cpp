@@ -8,12 +8,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
+#include <psapi.h>  // GetProcessMemoryInfo
 #include <fcntl.h>   // _O_BINARY
 #include <io.h>      // _fileno, _setmode
 #else
@@ -112,7 +115,25 @@ std::string meminfo_path() { return std::string(); }
 std::string self_cgroup_path() { return std::string(); }
 std::string cgroup_root() { return std::string(); }
 
-ProcessMemory process_memory() { return ProcessMemory{}; }   // the stall report names the Linux readings only
+ProcessMemory process_memory() {
+    ProcessMemory m;
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) m.avail_mib = (unsigned long long) ms.ullAvailPhys >> 20;
+    // The working set and its high-water mark are what the OS keeps resident for this process; PrivateUsage is what
+    // the process has charged to the commit limit on its own account, which is what a page-locked arena grows.
+    // PagefileUsage is the same figure as PrivateUsage, so it is not read twice, and Windows gives no reading of
+    // what one process has swapped out.
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*) &pmc, sizeof pmc)) {
+        m.faults = pmc.PageFaultCount;
+        m.rss_mib = (unsigned long long) pmc.WorkingSetSize >> 20;
+        m.peak_rss_mib = (unsigned long long) pmc.PeakWorkingSetSize >> 20;
+        m.private_mib = (unsigned long long) pmc.PrivateUsage >> 20;
+    }
+    return m;
+}
 
 int disk_rotational(const std::string&, std::string&) {
     return -1;   // sysfs names the queue on Linux; unknown means the caller does not warn
@@ -180,6 +201,8 @@ ProcessMemory process_memory() {
         return v;
     };
     m.rss_mib = kb("/proc/self/status", "VmRSS:") >> 10;
+    m.peak_rss_mib = kb("/proc/self/status", "VmHWM:") >> 10;
+    m.private_mib = kb("/proc/self/status", "VmSize:") >> 10;   // the address space this process holds on its own account
     m.commit_mib = kb("/proc/self/status", "VmSwap:") >> 10;
     m.avail_mib = kb("/proc/meminfo", "MemAvailable:") >> 10;
     return m;
@@ -223,5 +246,24 @@ ThreadWaits threads_in_disk_wait() {
 }
 
 #endif
+
+void wait_short(int ms) {
+#if defined(_WIN32)
+    // The scheduler's interval timer is coarser than a millisecond; a thread's own high-resolution timer is not,
+    // and being per-thread, one waiter re-arming cannot move another's deadline. The timeout on the wait is the
+    // bound rather than the wait: it keeps a timer that never signals from hanging the loop that is polling.
+    static thread_local HANDLE timer =
+        CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (timer != nullptr) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG) ms * 10000LL;   // relative, in 100-ns units
+        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+            WaitForSingleObject(timer, (DWORD) ms + 1);
+            return;
+        }
+    }
+#endif
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
 
 }  // namespace basalt::platform

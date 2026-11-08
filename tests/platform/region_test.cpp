@@ -33,6 +33,15 @@ int main() {
         check(zero, "the region starts zero-filled");
         std::memset(p, 0xa5, bytes);
         check(p[0] == 0xa5 && p[bytes - 1] == 0xa5, "every byte of it is writable");
+        // A region that reports large pages has to prove it from its own pages: the allocation call being accepted is
+        // not the claim - a large-page commit into an existing reservation is accepted and hands back 4 KB pages.
+        uint64_t sampled = 0, large = 0;
+        region_page_backing(p, bytes, sampled, large);
+        std::printf("region pages: backing %s, %llu of %llu addresses reported large\n",
+                    backing == RegionBacking::LargePages ? "large pages" : "normal pages",
+                    (unsigned long long) large, (unsigned long long) sampled);
+        check(backing != RegionBacking::LargePages || (sampled > 0 && large > 0),
+              "a region that claims large pages has them");
         free_region(base, base_bytes);
     }
     free_region(nullptr, 0);

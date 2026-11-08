@@ -18,3 +18,7 @@ __pycache__/
 # Local working notes for the Windows port: scratch planning, not project docs.
 docs/WINDOWS-ROADMAP.md
 docs/REBASE-PLAN.md
+docs/WINDOWS-PERF-LOG.md
+
+# Snapshot copies of those notes, taken between editing passes.
+.roadmap-backups/
